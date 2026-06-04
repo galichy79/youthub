@@ -2,7 +2,7 @@
 
 Полноценный YouTube-клиент для терминала: TUI-сетка с превью, воспроизведение в 1080p, рекомендации, поиск, SponsorBlock, статистика просмотров — без браузера, без yt-dlp в пути воспроизведения.
 
-![Подробно в видео](https://www.youtube.com/watch?v=NwrO-gzd-50)
+[Подробно в видео](https://www.youtube.com/watch?v=NwrO-gzd-50)
 
 ![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)
 
