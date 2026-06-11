@@ -209,7 +209,8 @@ def play_video(video_id: str, on_ready=None) -> int:
                 )
             except Exception as e:
                 with open(_PLAY_LOG, "a") as f:
-                    f.write(f"\n[grid] bridge_player.start failed: {e}\n")
+                    f.write(f"\n{time.strftime('%m-%d %H:%M:%S')} "
+                            f"[grid] bridge_player.start failed: {e}\n")
                 return 1
 
             # Focus the new ffplay window so the user's `q` actually

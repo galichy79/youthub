@@ -294,13 +294,27 @@ def _advance_to_next_alive(state: dict) -> Strategy:
         if _is_alive(state, cand.id):
             state["current"] = cand.id
             return cand
-    # All dead: new round.
+    # All dead: new round. Start it from the strategy with the best
+    # track record, not the head of the list — in practice only a few
+    # strategies ever get through the wall (chrome131-direct & co.),
+    # so a fresh round should probe those first instead of burning
+    # time on combos that have never won.
     state["round"] = state.get("round", 1) + 1
     for rec in state["strategies"].values():
         rec["alive"] = True
-    state["current"] = STRATEGIES[0].id
-    _log(f"all strategies died — starting round {state['round']}")
-    return STRATEGIES[0]
+    best = max(
+        STRATEGIES,
+        key=lambda s: (
+            state["strategies"].get(s.id, {}).get("wins", 0),
+            state["strategies"].get(s.id, {}).get("last_win", 0),
+        ),
+    )
+    if state["strategies"].get(best.id, {}).get("wins", 0) == 0:
+        best = STRATEGIES[0]  # no history yet — keep old behaviour
+    state["current"] = best.id
+    _log(f"all strategies died — starting round {state['round']} "
+         f"from {best.id}")
+    return best
 
 
 def get_current() -> Strategy:
@@ -575,15 +589,36 @@ def _stats_dump() -> int:
     return 0
 
 
+def _advance_main() -> int:
+    """Force-advance the sticky pointer to the next alive strategy.
+
+    For callers whose failure pr_fetch can't see: bridge_player uses
+    this when a strategy fetches a PR fine but the SABR stream built
+    from it produces zero bytes — without this nudge the strategy
+    stays "current" forever and every retry rolls the same dice.
+    The current strategy is NOT marked dead: it does work for PR
+    fetching, we just want different inputs for the next attempt.
+    """
+    state = _load_state()
+    old = state["current"]
+    new = _advance_to_next_alive(state)
+    _save_state(state)
+    _log(f"advance: {old} → {new.id}")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--telemetry":
         return _telemetry_main()
     if len(sys.argv) >= 2 and sys.argv[1] == "--stats":
         return _stats_dump()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--advance":
+        return _advance_main()
     if len(sys.argv) < 2:
         sys.stderr.write(
             "usage: pr_fetch.py <video_id>\n"
-            "       pr_fetch.py --stats\n")
+            "       pr_fetch.py --stats\n"
+            "       pr_fetch.py --advance\n")
         return 64
 
     vid = sys.argv[1]

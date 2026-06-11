@@ -638,7 +638,7 @@ def start_player(
     log = open(log_path, "a")
 
     def logprint(msg: str) -> None:
-        log.write(msg + "\n"); log.flush()
+        log.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n"); log.flush()
 
     logprint(f"=== bridge_player {video_id} ===")
 
@@ -702,6 +702,15 @@ def start_player(
         except Exception: pass
         try: os.killpg(os.getpgid(bridge.pid), 9)
         except Exception: pass
+        # Bot-wall refusal means the bridge already swept the FULL
+        # pr_fetch rotation (24 strategies) and everything got walled.
+        # A second sweep seconds later can't succeed — the wall is
+        # time-based — and just hammers ~24 more requests into it,
+        # possibly prolonging the rate-limit. Fail fast instead.
+        if reply and "bot-wall" in reply:
+            logprint("bot-wall after full rotation — not retrying "
+                     "(wall is time-based; wait or change proxy)")
+            raise RuntimeError(f"bridge START_SESSION refused: {reply!r}")
         if _retry > 0:
             logprint(f"START_SESSION refused ({reply!r}) — retrying with "
                      "fresh bootstrap")
@@ -730,6 +739,22 @@ def start_player(
         try: tmpfile.unlink()
         except Exception: pass
         if _retry > 0:
+            # The PR fetch *succeeded* (that's how we got this far), so
+            # pr_fetch's sticky pointer still says "this strategy is
+            # fine" — but the SABR stream built from its PR is dead.
+            # Without a nudge the retry re-rolls the exact same dice:
+            # same strategy → same client → often the same dead CDN.
+            # Force-advance the rotation so the retry fetches the PR
+            # through a different (TLS, IP, client) combo.
+            try:
+                adv = subprocess.run(
+                    [str(PROJECT_DIR / ".venv" / "bin" / "python3.11"),
+                     str(PROJECT_DIR / "pr_fetch.py"), "--advance"],
+                    capture_output=True, text=True, timeout=10)
+                logprint("strategy advance: "
+                         + (adv.stderr.strip() or f"exit {adv.returncode}"))
+            except Exception as e:
+                logprint(f"strategy advance failed (non-fatal): {e}")
             logprint("first session empty — retrying with fresh bootstrap")
             print("[bridge_player] first session empty — retrying with "
                   "fresh bootstrap", file=sys.stderr, flush=True)
