@@ -211,7 +211,9 @@ def play_video(video_id: str, on_ready=None) -> int:
                 with open(_PLAY_LOG, "a") as f:
                     f.write(f"\n{time.strftime('%m-%d %H:%M:%S')} "
                             f"[grid] bridge_player.start failed: {e}\n")
-                return 1
+                # 3 = YT bot-wall (rate-limit): the grid shows a
+                # human message instead of the generic exit-1 text.
+                return 3 if "bot-wall" in str(e) else 1
 
             # Focus the new ffplay window so the user's `q` actually
             # closes it (dwm sometimes parks floating windows behind).
@@ -1191,9 +1193,17 @@ def main() -> int:
                             pass
 
                     if rc != 0:
-                        sys.stderr.write(
-                            f"\n[grid] play_video failed (exit {rc}). "
-                            f"See {_PLAY_LOG} for details. Press any key.\n")
+                        if rc == 3:
+                            sys.stderr.write(
+                                "\n[grid] YouTube временно блокирует "
+                                "запросы (бот-стена). Это пройдёт само — "
+                                "подождите 5-30 минут или смените прокси "
+                                "и попробуйте снова. Press any key.\n")
+                        else:
+                            sys.stderr.write(
+                                f"\n[grid] play_video failed (exit {rc}). "
+                                f"See {_PLAY_LOG} for details. "
+                                f"Press any key.\n")
                         sys.stderr.flush()
                         keys.suspend()
                         try:

@@ -702,15 +702,19 @@ def start_player(
         except Exception: pass
         try: os.killpg(os.getpgid(bridge.pid), 9)
         except Exception: pass
-        # Bot-wall refusal means the bridge already swept the FULL
-        # pr_fetch rotation (24 strategies) and everything got walled.
-        # A second sweep seconds later can't succeed — the wall is
-        # time-based — and just hammers ~24 more requests into it,
-        # possibly prolonging the rate-limit. Fail fast instead.
-        if reply and "bot-wall" in reply:
-            logprint("bot-wall after full rotation — not retrying "
-                     "(wall is time-based; wait or change proxy)")
-            raise RuntimeError(f"bridge START_SESSION refused: {reply!r}")
+        # Bot-wall refusal means the bridge swept the FULL pr_fetch
+        # rotation and everything got walled. The wall is flaky rather
+        # than strictly time-based — log history shows a second sweep
+        # sometimes slips through (even on strategies that never won
+        # before) — so a retry is worth it, but only after a cooldown:
+        # back-to-back sweeps hammer ~24 more requests into the wall
+        # for the lowest chance of success.
+        if reply and "bot-wall" in reply and _retry > 0:
+            logprint("bot-wall after full rotation — cooling down 15s "
+                     "before one more sweep")
+            print("[bridge_player] бот-стена: пауза 15с, затем ещё одна "
+                  "попытка…", file=sys.stderr, flush=True)
+            time.sleep(15.0)
         if _retry > 0:
             logprint(f"START_SESSION refused ({reply!r}) — retrying with "
                      "fresh bootstrap")
