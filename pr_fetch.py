@@ -352,6 +352,48 @@ def record_death(sid: str) -> None:
     _save_state(state)
 
 
+# --------------------------- signatureTimestamp ---------------------------
+
+STS_FILE = CACHE_DIR / "sts.json"
+_STS_FALLBACK = 20612  # mid-2026; only used if fetch + cache both fail
+
+
+def _get_sts() -> int:
+    """Current signatureTimestamp from YouTube's player JS, cached 12h.
+
+    TVHTML5 /player answers UNPLAYABLE "The page needs to be reloaded"
+    when the sts in playbackContext is stale, so a hardcoded value rots
+    within weeks. The player JS is a static asset — it is served even
+    while /watch is bot-walled.
+    """
+    cached = None
+    try:
+        cached = json.loads(STS_FILE.read_text())
+        if time.time() - cached["fetched_at"] < 12 * 3600:
+            return cached["sts"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    try:
+        r = requests.get("https://www.youtube.com/iframe_api",
+                         impersonate="chrome131", timeout=15)
+        pid = re.search(r"player\\?/([0-9a-f]{8})", r.text).group(1)
+        js = requests.get(
+            f"https://www.youtube.com/s/player/{pid}"
+            "/player_ias.vflset/en_US/base.js",
+            impersonate="chrome131", timeout=20)
+        sts = int(re.search(r"signatureTimestamp[:=](\d{5})",
+                            js.text).group(1))
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        STS_FILE.write_text(json.dumps(
+            {"sts": sts, "fetched_at": int(time.time())}))
+        return sts
+    except Exception as e:
+        _log(f"sts fetch failed: {e}")
+        if cached:
+            return cached["sts"]  # expired cache beats the hardcode
+        return _STS_FALLBACK
+
+
 # --------------------------- fetch primitives ---------------------------
 
 
@@ -441,7 +483,7 @@ def _fetch_innertube(sess: requests.Session, strat: Strategy,
         "playbackContext": {
             "contentPlaybackContext": {
                 "html5Preference": "HTML5_PREF_WANTS",
-                "signatureTimestamp": 20100,
+                "signatureTimestamp": _get_sts(),
             },
         },
     }
