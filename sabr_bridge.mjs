@@ -282,10 +282,65 @@ const ctx = {
   durationMs: 0,
   allFormats: null,
   poToken: undefined,
+  // Set when YouTube demands re-attestation. The next startSession()
+  // then mints a fresh PO Token before opening the SabrStream, so a
+  // restart after an attestation failure doesn't inherit the dead one.
+  poTokenStale: false,
+  visitorData: null,
   accessToken: null,
   pickVideo: null,
   pickAudio: null,
 };
+
+// --------------------------- PO Token renewal ---------------------------
+// YouTube escalates SABR stream protection as a session ages: status 2
+// is "attestation pending", status 3 is "attestation required" — and
+// googlevideo throws on 3, killing the stream outright. The PO Token
+// handed to SabrStream is minted once in initOnce(); once YouTube stops
+// accepting it the stream dies, and every later session inherits the
+// same dead token. Re-mint on those signals and hand the fresh token to
+// the live stream (SabrStream.setPoToken) and to the next session.
+//
+// status 2 also fires normally right after start (the server validating
+// the token we just sent), so proactive renewal is rate-limited: a mint
+// costs ~3 s of CPU + an HTTP round-trip.
+const PO_TOKEN_REFRESH_COOLDOWN_MS = 90_000;
+let poTokenRefresh = null;        // in-flight mint, deduped
+let lastPoTokenMintAt = 0;
+
+function refreshPoToken(reason) {
+  if (poTokenRefresh) return poTokenRefresh;   // one mint at a time
+  if (!ctx.visitorData) {
+    log(`PO Token refresh skipped (${reason}): no visitorData — `
+        + 'attestation cannot be satisfied');
+    return Promise.resolve();
+  }
+  poTokenRefresh = (async () => {
+    try {
+      log(`PO Token refresh (${reason}) bound to videoId=${videoId}`);
+      const t0 = Date.now();
+      const token = await getPoToken(ctx.visitorData, videoId);
+      ctx.poToken = token;
+      ctx.poTokenStale = false;
+      lastPoTokenMintAt = Date.now();
+      log(`PO Token refreshed: ${token.length}B in ${Date.now()-t0}ms`);
+      // Hand it to the live stream so the next segment fetch carries it.
+      // Futile when the current session is already dead — harmless.
+      try { currentSession?.sabr?.setPoToken(token); } catch { /* */ }
+    } catch (e) {
+      ctx.poTokenStale = true;
+      log(`PO Token refresh failed (${reason}): ${e?.message ?? e}`);
+    } finally {
+      poTokenRefresh = null;
+    }
+  })();
+  return poTokenRefresh;
+}
+
+function maybeRefreshPoToken(reason) {
+  if (Date.now() - lastPoTokenMintAt < PO_TOKEN_REFRESH_COOLDOWN_MS) return;
+  refreshPoToken(reason);
+}
 
 async function initOnce() {
   // Three-tier playerResponse resolution:
@@ -344,6 +399,7 @@ async function initOnce() {
     || ctx.pr.responseContext?.serviceTrackingParams
         ?.flatMap(s => s.params || [])
         ?.find(p => p.key === 'visitor_data')?.value;
+  ctx.visitorData = visitorData ?? null;
   if (visitorData) {
     try {
       // SABR /videoplayback expects a content-bound PO Token (bound
@@ -352,6 +408,7 @@ async function initOnce() {
       log(`generating PO Token (bgutils) bound to videoId=${videoId}`);
       const t0 = Date.now();
       ctx.poToken = await getPoToken(visitorData, videoId);
+      lastPoTokenMintAt = Date.now();
       log(`PO Token ready: ${ctx.poToken.length}B in ${Date.now()-t0}ms`);
     } catch (e) {
       log(`bgutils PO Token failed: ${e?.message ?? e}`);
@@ -454,6 +511,10 @@ async function startSession({ outputPath, startAtSec }) {
   // immediately because initReady is already resolved.
   if (initReady) await initReady;
   await stopSession();
+  // The previous session may have died to `attestation required`, which
+  // invalidates the PO Token. Mint a fresh one before opening the new
+  // session — reusing the dead token would fail exactly the same way.
+  if (ctx.poTokenStale) await refreshPoToken('stale token before new session');
   const id = ++sessionCounter;
   const startAtMs = Math.max(0, Math.floor(startAtSec * 1000));
   log(`session #${id} → ${outputPath}  start_at=${startAtMs}ms`);
@@ -504,8 +565,22 @@ async function startSession({ outputPath, startAtSec }) {
     durationMs: ctx.durationMs,
     formats: ctx.allFormats,
   });
-  sabr.on('streamProtectionStatusUpdate', s =>
-    log(`session #${id} stream protection ${JSON.stringify(s)}`));
+  sabr.on('streamProtectionStatusUpdate', s => {
+    log(`session #${id} stream protection ${JSON.stringify(s)}`);
+    // 1 = throttled, 2 = attestation pending, 3 = attestation required.
+    // googlevideo throws immediately after emitting 3, so nothing here
+    // can save THIS session — but it can save the next one.
+    if (s?.status === 2) {
+      maybeRefreshPoToken('protection status 2');
+    } else if (s?.status === 3) {
+      // Status 3 repeats on every failed segment fetch, so minting here
+      // would run dozens of times per dead session. Mark the token stale
+      // and let the cooldown (or, failing that, the next startSession)
+      // do the single mint that actually matters.
+      ctx.poTokenStale = true;
+      maybeRefreshPoToken('protection status 3');
+    }
+  });
   sabr.on('error', e => log(`session #${id} sabr error: ${e?.message ?? e}`));
 
   // videoFormat = itag number (lets SabrStream pick the only matching
@@ -572,7 +647,9 @@ async function handleControlLine(line, write) {
         outputPath: kv.path,
         startAtSec: Number(kv.start_at || '0'),
       });
-      write(`OK session=${id}\n`);
+      // duration_ms lets bridge_player tell "stream died mid-video" from
+      // "video finished" when its stall watchdog fires.
+      write(`OK session=${id} duration_ms=${ctx.durationMs}\n`);
     } catch (e) {
       write(`ERR ${e?.message ?? e}\n`);
     }
