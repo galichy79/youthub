@@ -172,14 +172,24 @@ export async function getPoToken(visitorData, contentBinding) {
   // `mintCallback instanceof Function` check that fails for callbacks
   // created inside jsdom — cross-realm Functions don't satisfy the
   // node-side `instanceof Function`. Using typeof works in both.
-  const getMinter = cached.webPoSignalOutput[0];
-  if (typeof getMinter !== 'function')
-    throw new Error('webPoSignalOutput[0] is not a function');
-  const itBytes = _b64urlDecode(cached.integrityTokenData.integrityToken);
-  const mintFn = await getMinter(itBytes);
-  if (typeof mintFn !== 'function')
-    throw new Error('mint callback is not a function');
-  const out = await mintFn(new TextEncoder().encode(identifier));
+  //
+  // The minter is derived ONCE per integrity token and cached. Deriving
+  // it again for every mint (`webPoSignalOutput[0](itBytes)`) makes each
+  // successive token ~88 bytes longer — the snapshot's signal-output
+  // closure accumulates state — so a re-minted token would not match the
+  // shape of the original. Reusing one mintFn keeps tokens a stable size,
+  // which is what makes mid-session re-attestation (see sabr_bridge.mjs)
+  // viable: mint once at start, mint again on demand, same token size.
+  if (typeof cached.mintFn !== 'function') {
+    const getMinter = cached.webPoSignalOutput[0];
+    if (typeof getMinter !== 'function')
+      throw new Error('webPoSignalOutput[0] is not a function');
+    const itBytes = _b64urlDecode(cached.integrityTokenData.integrityToken);
+    cached.mintFn = await getMinter(itBytes);
+    if (typeof cached.mintFn !== 'function')
+      throw new Error('mint callback is not a function');
+  }
+  const out = await cached.mintFn(new TextEncoder().encode(identifier));
   if (!(out && out.length))
     throw new Error('mint returned empty');
   return _b64urlEncode(out);

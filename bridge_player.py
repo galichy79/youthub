@@ -62,10 +62,35 @@ SEEK_SAFETY_BYTES = 2 * 1024 * 1024
 # pointless restart cascades.
 SEEK_COOLDOWN_SEC = 0.5
 
+# Stall watchdog. The SABR stream can die silently mid-video (YouTube
+# escalates stream protection to "attestation required" and googlevideo
+# throws): ffmpeg stops writing, ffplay freezes on the last frame, and
+# nothing tells us. If the tmpfile stops growing well short of the end
+# of the video, re-open the session there — the bridge mints a fresh PO
+# Token for it (see sabr_bridge.mjs).
+STALL_TIMEOUT_SEC = 12.0     # frozen this long → assume the stream died
+STALL_POLL_SEC = 2.0         # how often to stat the tmpfile
+STALL_END_MARGIN_SEC = 5.0   # within this of the end → it just finished
+STALL_MAX_FAILURES = 4       # consecutive failed restarts before giving up
+
 # Recommendation sidebar (Tab inside ffplay-yt). On by default — set
 # SIDEBAR_RECS=0 to disable if it ever causes regressions.
 SIDEBAR_RECS = os.environ.get("SIDEBAR_RECS", "1") == "1"
 RECS_PIPELINE = PROJECT_DIR / "recs_pipeline.py"
+
+
+def _parse_session_reply(reply: Optional[str]) -> dict:
+    """Pull `k=v` pairs out of a bridge reply.
+
+    The bridge answers `OK session=1 duration_ms=12345`; older builds
+    answered just `OK session=1`, so every key is optional.
+    """
+    out = {}
+    for tok in (reply or "").split()[1:]:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +231,10 @@ class LivePlayer:
     _last_pos_sec: float = 0.0
     _file_start_sec: float = 0.0
     _last_seek_at: float = 0.0
+    # Video length, taken from the bridge's START_SESSION reply. 0 until
+    # known; the stall watchdog treats 0 as "unknown" and stays cautious.
+    _duration_sec: float = 0.0
+    _stall_failures: int = 0
     # SponsorBlock segments: (start_sec, end_sec, category) sorted by start.
     # Auto-skip triggered when playhead enters a segment.
     sponsor_segments: list = field(default_factory=list)
@@ -237,6 +266,9 @@ class LivePlayer:
             target=self._controller_loop, daemon=True,
             name="bridge_player.controller")
         self._ctrl_thread.start()
+        threading.Thread(
+            target=self._watchdog_loop, daemon=True,
+            name="bridge_player.watchdog").start()
 
     def wait(self) -> int:
         rc = self.ffplay.wait()
@@ -344,6 +376,88 @@ class LivePlayer:
                     self._handle_event(line.decode("utf-8", "ignore").strip(), cprint)
         finally:
             cprint("[controller] exiting")
+            log.close()
+
+    # ---- stall watchdog (SABR side) ----
+
+    def _watchdog_loop(self) -> None:
+        """Re-open the session when the SABR stream dies without saying so.
+
+        A dead stream looks like this: the bridge's SabrStream throws
+        (YouTube escalating to `attestation required`), its pumps end,
+        ffmpeg finalises the tmpfile early, and ffplay freezes on the
+        last frame — but nothing on the IPC channel reports a problem,
+        and ffplay stays alive, so wait() never returns.
+
+        The signal is the tmpfile going quiet — no new bytes for
+        STALL_TIMEOUT_SEC. The playhead is NOT usable for this: once the
+        file stops growing, ffplay keeps running its master clock while
+        it drains whatever is buffered, so POS keeps advancing and would
+        reset any "is it still moving?" timer forever.
+
+        Resume from the playhead as it was when data last arrived, which
+        is where the content actually ends. Everything after that was
+        buffer, so this replays a little instead of skipping the stretch
+        the clock ran past.
+        """
+        log = open(self.log_path, "a")
+        def cprint(m: str) -> None:
+            try: log.write(m + "\n"); log.flush()
+            except Exception: pass
+
+        last_size = -1
+        last_change = time.time()
+        resume_sec = self._last_pos_sec
+        backoff = STALL_TIMEOUT_SEC
+        try:
+            while not self._shutdown.wait(STALL_POLL_SEC):
+                try:
+                    size = self.tmpfile.stat().st_size
+                except OSError:
+                    continue
+                if size != last_size:
+                    last_size = size
+                    last_change = time.time()
+                    resume_sec = self._last_pos_sec
+                    continue
+                # A restart is already underway; its 4 MB priming wait
+                # covers the quiet period, so start counting afresh.
+                if self._restart_lock.locked():
+                    last_change = time.time()
+                    continue
+                frozen_for = time.time() - last_change
+                if frozen_for < backoff:
+                    continue
+                # Distinguish "the stream died" from "the whole video is
+                # already on disk". A finished download stops growing at
+                # the end of the video, so the guard below skips it; a
+                # dead stream stops well short of the end.
+                if (self._duration_sec > 0
+                        and resume_sec >= self._duration_sec - STALL_END_MARGIN_SEC):
+                    last_change = time.time()
+                    continue
+                cprint(f"[watchdog] no new data for {frozen_for:.0f}s "
+                       f"(last data at {resume_sec:.1f}s of "
+                       f"{self._duration_sec:.1f}s, clock now "
+                       f"{self._last_pos_sec:.1f}s) — reopening session")
+                before = self.tmpfile
+                self._restart_at(resume_sec, cprint)
+                if self.tmpfile == before:
+                    # Bridge refused. Back off rather than hammering it.
+                    self._stall_failures += 1
+                    if self._stall_failures >= STALL_MAX_FAILURES:
+                        cprint(f"[watchdog] giving up after "
+                               f"{self._stall_failures} failed restarts — "
+                               f"press q and start the video again")
+                        return
+                    backoff = min(backoff * 2, 120.0)
+                else:
+                    self._stall_failures = 0
+                    backoff = STALL_TIMEOUT_SEC
+                # New tmpfile (or a retry): resync on the next tick.
+                last_size = -1
+                last_change = time.time()
+        finally:
             log.close()
 
     def _handle_event(self, line: str, cprint) -> None:
@@ -578,6 +692,10 @@ class LivePlayer:
                 try: new_tmp.unlink()
                 except Exception: pass
                 return
+            kv = _parse_session_reply(reply)
+            if kv.get("duration_ms"):
+                try: self._duration_sec = float(kv["duration_ms"]) / 1000.0
+                except ValueError: pass
 
             # Prime the tmpfile with enough data that ffplay won't
             # immediately catch up to the writer's live edge. 512 KB
@@ -716,6 +834,11 @@ def start_player(
             )
         raise RuntimeError(f"bridge START_SESSION refused: {reply!r}")
 
+    try:
+        duration_sec = float(_parse_session_reply(reply).get("duration_ms", 0)) / 1000.0
+    except ValueError:
+        duration_sec = 0.0
+
     if not _wait_for_min_bytes(tmpfile, 512 * 1024, timeout=25.0):
         logprint("first session produced no usable output in 25s")
         try: bridge_ctrl.send("QUIT", reply_timeout=1.0)
@@ -785,6 +908,7 @@ def start_player(
         video_id=video_id, window_title=window_title, env=env,
         sponsor_segments=sponsor_segs,
         _session_counter=0,
+        _duration_sec=duration_sec,
     )
     lp.start_controller()
 
