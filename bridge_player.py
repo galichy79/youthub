@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -51,6 +52,75 @@ from watchstats import WatchStats  # noqa: E402
 
 
 FFPLAY_YT = PROJECT_DIR / "ffplay-yt" / "bin" / "ffplay-yt"
+
+# youtubei.js 17 imports JSON through import attributes
+# (`import pkg from './package.json' with { type: 'json' }`), which Node
+# only parses from 20.10 on. Older Node dies on the very first import of
+# the bridge with "SyntaxError: Unexpected token 'with'", the control
+# socket never opens, and the player waits 20 s then reports a dead
+# bridge — with nothing in the log pointing at the interpreter.
+# This bites whenever the app is launched without an interactive shell in
+# the picture (desktop launcher, IDE, cron): nvm lives in ~/.bashrc and
+# ~/.zshrc only, so PATH there holds the distro's Node 18.
+NODE_MIN_VERSION = (20, 10)
+
+
+def _node_version(exe: str) -> Optional[tuple[int, ...]]:
+    """Parse `node --version`; None if it does not run or is unparsable."""
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out.startswith("v"):
+        return None
+    try:
+        return tuple(int(part) for part in out[1:].split("."))
+    except ValueError:
+        return None
+
+
+def _resolve_node() -> str:
+    """Path to a Node new enough for the bridge.
+
+    nvm's installs win over PATH: that is where a modern Node lives on
+    this machine, while PATH may hand back the distro's Node 18. Fail
+    loudly rather than let the bridge die silently 20 s downstream.
+    """
+    candidates: list[Path] = []
+    versions_dir = Path(os.environ.get("NVM_DIR") or Path.home() / ".nvm") \
+        / "versions" / "node"
+    if versions_dir.is_dir():
+
+        def _semver(bin_path: Path) -> tuple[int, ...]:
+            try:
+                return tuple(int(p) for p in
+                             bin_path.parent.parent.name.lstrip("v").split("."))
+            except ValueError:
+                return (0,)
+
+        candidates += sorted(versions_dir.glob("v*/bin/node"), key=_semver,
+                             reverse=True)
+    on_path = shutil.which("node")
+    if on_path:
+        candidates.append(Path(on_path))
+
+    seen: set[str] = set()
+    for exe in candidates:
+        if str(exe) in seen:
+            continue
+        seen.add(str(exe))
+        ver = _node_version(str(exe))
+        if ver and ver >= NODE_MIN_VERSION:
+            return str(exe)
+
+    wanted = ".".join(str(p) for p in NODE_MIN_VERSION)
+    found = ", ".join(f"{c} ({_node_version(str(c))})" for c in candidates)
+    raise RuntimeError(
+        f"нужен Node ≥ {wanted} — youtubei.js собирает JSON через import "
+        f"attributes. Проверены: {found or 'ничего не найдено'}. "
+        f"Установите: nvm install 22")
+
 
 # 2 MB ≈ a couple of seconds of 1080p — buffer between current playhead
 # and "must restart" decision so we don't trigger restarts on jitter.
@@ -760,6 +830,14 @@ def start_player(
 
     logprint(f"=== bridge_player {video_id} ===")
 
+    # Pick the interpreter explicitly and pin it into the child's PATH, so
+    # a bare "node" from any later spawn (and from the bridge's own
+    # children) resolves to the same adequate one.
+    node_exe = _resolve_node()
+    node_ver = ".".join(str(p) for p in _node_version(node_exe) or ())
+    env["PATH"] = str(Path(node_exe).parent) + os.pathsep + env.get("PATH", "")
+    logprint(f"node: {node_exe} (v{node_ver})")
+
     # PO Token + playerResponse now come from inside the Node bridge
     # (bgutils-js + browser-headers /watch fetch). No Camoufox needed.
     # `_force_rebootstrap` is kept as a no-op param so the retry path
@@ -770,7 +848,7 @@ def start_player(
     bridge_sock = Path(tempfile.mkstemp(
         prefix=f"ytlive_{video_id}_bridge_", suffix=".sock")[1])
     bridge_sock.unlink(missing_ok=True)
-    bridge_cmd = ["node", str(PROJECT_DIR / "sabr_bridge.mjs"),
+    bridge_cmd = [node_exe, str(PROJECT_DIR / "sabr_bridge.mjs"),
                   video_id, "--control", str(bridge_sock)]
     logprint(f"bridge spawn: {shlex.join(bridge_cmd)}")
     # start_new_session=True puts the bridge (and its ffmpeg children)
