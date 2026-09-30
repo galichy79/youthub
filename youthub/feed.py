@@ -86,6 +86,7 @@ def parse_tile(tile: dict) -> Optional[Video]:
     on_select = tile.get("onSelectCommand", {})
     watch = on_select.get("watchEndpoint")
     if not watch or "videoId" not in watch:
+        # not a video tile (could be channel/playlist tile) — skip for now
         return None
 
     header = tile.get("header", {}).get("tileHeaderRenderer", {})
@@ -102,6 +103,7 @@ def parse_tile(tile: dict) -> Optional[Video]:
 
     title = _text(metadata.get("title")) or ""
 
+    # Lines: typically line[0] = channel, line[1] = badges + views + age
     channel = None
     views = None
     age = None
@@ -120,10 +122,14 @@ def parse_tile(tile: dict) -> Optional[Video]:
             if not txt:
                 continue
             low = txt.lower()
+            # Multilingual heuristics — YT localises these strings
+            # based on the hl/gl context (we send hl=ru so Russian
+            # videos return Russian text). Keep English markers too
+            # so mixed-language users still parse correctly.
             is_views = "view" in low or "просмотр" in low
             is_age = ("ago" in low
                       or "назад" in low
-                      or low.startswith("стрим"))
+                      or low.startswith("стрим"))   # "Стрим был ... назад"
             if channel is None and not is_views and not is_age and txt != "•":
                 channel = txt
             elif is_views:
@@ -146,45 +152,66 @@ def parse_tile(tile: dict) -> Optional[Video]:
 
 
 def parse_lockup(lockup: dict) -> Optional[Video]:
-    """Parse one lockupViewModel into a Video. Newer YouTube surfaces (search,
-    short-form shelves) use this instead of tileRenderer."""
-    cid = lockup.get("contentId")
-    if not cid:
+    """Parse one lockupViewModel into a Video.
+
+    YouTube is migrating TVHTML5 surfaces from tileRenderer to the new
+    ViewModel architecture; search shelves now return a mix of both.
+    The lockup is flatter than a tile: videoId sits in `contentId`,
+    title/channel/views/age live under lockupMetadataViewModel, and the
+    duration is a thumbnail overlay badge.
+    """
+    watch = (
+        lockup.get("rendererContext", {})
+        .get("commandContext", {})
+        .get("onTap", {})
+        .get("innertubeCommand", {})
+        .get("watchEndpoint", {})
+    )
+    # Same rule as parse_tile: anything that opens a watchEndpoint is
+    # playable (VIDEO and MUSIC lockups both do); channel/playlist
+    # lockups navigate elsewhere and get skipped.
+    video_id = watch.get("videoId")
+    if not video_id:
         return None
 
-    # Only video/short content types
-    ctype = lockup.get("contentType", "")
-    if ctype not in ("LOCKUP_CONTENT_TYPE_VIDEO", "LOCKUP_CONTENT_TYPE_SHORT"):
-        return None
+    md = lockup.get("metadata", {}).get("lockupMetadataViewModel", {})
+    title = (md.get("title") or {}).get("content") or ""
 
-    # Thumbnail
-    thumb_vm = lockup.get("contentImage", {}).get("thumbnailViewModel", {})
-    thumb_url = _best_thumbnail(thumb_vm.get("image", {}).get("sources", []))
+    thumb = lockup.get("contentImage", {}).get("thumbnailViewModel", {})
+    thumb_url = _best_thumbnail(thumb.get("image", {}).get("sources", []))
 
-    # Duration from overlay badges
+    # Duration is an overlay badge ("6:10:58"); live streams put their
+    # status text there instead ("В ЭФИРЕ") — same slot the old
+    # thumbnailOverlayTimeStatusRenderer used, so keep the semantics.
     duration = None
-    for ov in thumb_vm.get("overlays", []) or []:
-        bottom = ov.get("thumbnailBottomOverlayViewModel", {})
-        for badge in bottom.get("badges", []) or []:
-            dur = badge.get("thumbnailBadgeViewModel", {}).get("text")
-            if dur:
-                duration = dur
+    for ov in thumb.get("overlays", []) or []:
+        for b in (ov.get("thumbnailBottomOverlayViewModel", {})
+                    .get("badges", []) or []):
+            txt = b.get("thumbnailBadgeViewModel", {}).get("text")
+            if txt:
+                duration = txt
                 break
+        if duration:
+            break
 
-    # Metadata
-    meta = lockup.get("metadata", {}).get("lockupMetadataViewModel", {})
-    title = meta.get("title", {}).get("content") or ""
-
-    cmv = meta.get("metadata", {}).get("contentMetadataViewModel", {})
-    rows = cmv.get("metadataRows", []) or []
+    # Rows: typically row[0] = channel, row[1] = views + age (+ badges).
+    # Reuse the same multilingual heuristics as parse_tile.
     channel = None
     views = None
     age = None
     badges: list[str] = []
-    for row in rows:
-        parts = row.get("metadataParts", []) or []
-        for part in parts:
-            txt = part.get("text", {}).get("content")
+    rows = (
+        md.get("metadata", {})
+        .get("contentMetadataViewModel", {})
+        .get("metadataRows", [])
+    )
+    for row in rows or []:
+        for b in row.get("badges", []) or []:
+            lbl = b.get("badgeViewModel", {}).get("badgeText")
+            if lbl:
+                badges.append(lbl)
+        for part in row.get("metadataParts", []) or []:
+            txt = (part.get("text") or {}).get("content")
             if not txt:
                 continue
             low = txt.lower()
@@ -192,23 +219,15 @@ def parse_lockup(lockup: dict) -> Optional[Video]:
             is_age = ("ago" in low
                       or "назад" in low
                       or low.startswith("стрим"))
-            if channel is None and not is_views and not is_age:
+            if channel is None and not is_views and not is_age and txt != "•":
                 channel = txt
             elif is_views:
                 views = txt
             elif is_age:
                 age = txt
 
-    # watchEndpoint — nested deep inside rendererContext
-    cmd = (
-        lockup.get("rendererContext", {})
-        .get("commandContext", {})
-        .get("onTap", {})
-        .get("innertubeCommand", {})
-    )
-    watch = cmd.get("watchEndpoint", {})
     return Video(
-        video_id=watch.get("videoId") or cid,
+        video_id=video_id,
         title=title,
         channel=channel,
         views=views,
@@ -245,16 +264,15 @@ def parse_shelf(shelf_node: dict) -> Optional[Shelf]:
     videos: list[Video] = []
     for it in items:
         tile = it.get("tileRenderer")
+        lockup = it.get("lockupViewModel")
         if tile:
             v = parse_tile(tile)
-            if v:
-                videos.append(v)
-            continue
-        lockup = it.get("lockupViewModel")
-        if lockup:
+        elif lockup:
             v = parse_lockup(lockup)
-            if v:
-                videos.append(v)
+        else:
+            continue
+        if v:
+            videos.append(v)
     return Shelf(title=title, videos=videos)
 
 
@@ -294,8 +312,9 @@ def parse_home(raw: dict) -> Feed:
 def parse_search(raw: dict) -> Feed:
     """Parse a TVHTML5 /search response into a Feed.
 
-    Search returns sectionListRenderer → shelfRenderer →
-    horizontalListRenderer → lockupViewModel (newer) or tileRenderer (older).
+    Same shape as home — sectionListRenderer → shelfRenderer →
+    horizontalListRenderer → tileRenderer — just without the
+    `tvBrowseRenderer` wrapper that home uses.
     """
     try:
         sections = raw["contents"]["sectionListRenderer"]["contents"]

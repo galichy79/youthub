@@ -67,7 +67,13 @@ if (!videoId) {
 }
 const persistent = !!controlSocketPath;
 
-function log(msg) { process.stderr.write(`[bridge] ${msg}\n`); }
+function ts() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} `
+       + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function log(msg) { process.stderr.write(`${ts()} [bridge] ${msg}\n`); }
 
 // --------------------------- shared helpers ---------------------------
 
@@ -166,12 +172,17 @@ async function fetchWatchPlayerResponse(vid) {
   for (let attempt = 1; attempt <= PR_FETCH_MAX_ATTEMPTS; attempt++) {
     try {
       const t0 = Date.now();
-      const { stdout } = await execFileP(py, [script, vid], {
+      const { stdout, stderr } = await execFileP(py, [script, vid], {
         timeout: PR_FETCH_TIMEOUT_MS,
         maxBuffer: 8 * 1024 * 1024,
         env: process.env,  // pass HTTPS_PROXY through
       });
       const ms = Date.now() - t0;
+      // pr_fetch announces its pick on stderr ("using <id> (round N)").
+      // Surface it on success too — otherwise the log only ever names
+      // strategies when they fail, and "which combo actually works"
+      // is invisible when debugging.
+      const strat = stderr?.match(/using (\S+ \(round \d+\))/)?.[1] ?? '?';
       let fetched;
       try { fetched = JSON.parse(stdout); }
       catch (e) {
@@ -180,7 +191,7 @@ async function fetchWatchPlayerResponse(vid) {
         continue;
       }
       if (fetched && fetched.streamingData) {
-        log(`pr_fetch ok in ${ms}ms (attempt ${attempt}/${PR_FETCH_MAX_ATTEMPTS})`);
+        log(`pr_fetch ok in ${ms}ms (attempt ${attempt}/${PR_FETCH_MAX_ATTEMPTS}, ${strat})`);
         return fetched;
       }
       // Strategy completed the request but YT returned an unplayable

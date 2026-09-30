@@ -294,13 +294,27 @@ def _advance_to_next_alive(state: dict) -> Strategy:
         if _is_alive(state, cand.id):
             state["current"] = cand.id
             return cand
-    # All dead: new round.
+    # All dead: new round. Start it from the strategy with the best
+    # track record, not the head of the list — in practice only a few
+    # strategies ever get through the wall (chrome131-direct & co.),
+    # so a fresh round should probe those first instead of burning
+    # time on combos that have never won.
     state["round"] = state.get("round", 1) + 1
     for rec in state["strategies"].values():
         rec["alive"] = True
-    state["current"] = STRATEGIES[0].id
-    _log(f"all strategies died — starting round {state['round']}")
-    return STRATEGIES[0]
+    best = max(
+        STRATEGIES,
+        key=lambda s: (
+            state["strategies"].get(s.id, {}).get("wins", 0),
+            state["strategies"].get(s.id, {}).get("last_win", 0),
+        ),
+    )
+    if state["strategies"].get(best.id, {}).get("wins", 0) == 0:
+        best = STRATEGIES[0]  # no history yet — keep old behaviour
+    state["current"] = best.id
+    _log(f"all strategies died — starting round {state['round']} "
+         f"from {best.id}")
+    return best
 
 
 def get_current() -> Strategy:
@@ -336,6 +350,48 @@ def record_death(sid: str) -> None:
     if state["current"] == sid:
         _advance_to_next_alive(state)
     _save_state(state)
+
+
+# --------------------------- signatureTimestamp ---------------------------
+
+STS_FILE = CACHE_DIR / "sts.json"
+_STS_FALLBACK = 20612  # mid-2026; only used if fetch + cache both fail
+
+
+def _get_sts() -> int:
+    """Current signatureTimestamp from YouTube's player JS, cached 12h.
+
+    TVHTML5 /player answers UNPLAYABLE "The page needs to be reloaded"
+    when the sts in playbackContext is stale, so a hardcoded value rots
+    within weeks. The player JS is a static asset — it is served even
+    while /watch is bot-walled.
+    """
+    cached = None
+    try:
+        cached = json.loads(STS_FILE.read_text())
+        if time.time() - cached["fetched_at"] < 12 * 3600:
+            return cached["sts"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    try:
+        r = requests.get("https://www.youtube.com/iframe_api",
+                         impersonate="chrome131", timeout=15)
+        pid = re.search(r"player\\?/([0-9a-f]{8})", r.text).group(1)
+        js = requests.get(
+            f"https://www.youtube.com/s/player/{pid}"
+            "/player_ias.vflset/en_US/base.js",
+            impersonate="chrome131", timeout=20)
+        sts = int(re.search(r"signatureTimestamp[:=](\d{5})",
+                            js.text).group(1))
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        STS_FILE.write_text(json.dumps(
+            {"sts": sts, "fetched_at": int(time.time())}))
+        return sts
+    except Exception as e:
+        _log(f"sts fetch failed: {e}")
+        if cached:
+            return cached["sts"]  # expired cache beats the hardcode
+        return _STS_FALLBACK
 
 
 # --------------------------- fetch primitives ---------------------------
@@ -427,7 +483,7 @@ def _fetch_innertube(sess: requests.Session, strat: Strategy,
         "playbackContext": {
             "contentPlaybackContext": {
                 "html5Preference": "HTML5_PREF_WANTS",
-                "signatureTimestamp": 20100,
+                "signatureTimestamp": _get_sts(),
             },
         },
     }
@@ -575,15 +631,36 @@ def _stats_dump() -> int:
     return 0
 
 
+def _advance_main() -> int:
+    """Force-advance the sticky pointer to the next alive strategy.
+
+    For callers whose failure pr_fetch can't see: bridge_player uses
+    this when a strategy fetches a PR fine but the SABR stream built
+    from it produces zero bytes — without this nudge the strategy
+    stays "current" forever and every retry rolls the same dice.
+    The current strategy is NOT marked dead: it does work for PR
+    fetching, we just want different inputs for the next attempt.
+    """
+    state = _load_state()
+    old = state["current"]
+    new = _advance_to_next_alive(state)
+    _save_state(state)
+    _log(f"advance: {old} → {new.id}")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--telemetry":
         return _telemetry_main()
     if len(sys.argv) >= 2 and sys.argv[1] == "--stats":
         return _stats_dump()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--advance":
+        return _advance_main()
     if len(sys.argv) < 2:
         sys.stderr.write(
             "usage: pr_fetch.py <video_id>\n"
-            "       pr_fetch.py --stats\n")
+            "       pr_fetch.py --stats\n"
+            "       pr_fetch.py --advance\n")
         return 64
 
     vid = sys.argv[1]
