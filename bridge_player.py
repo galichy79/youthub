@@ -142,6 +142,11 @@ STALL_TIMEOUT_SEC = 12.0     # frozen this long → assume the stream died
 STALL_POLL_SEC = 2.0         # how often to stat the tmpfile
 STALL_END_MARGIN_SEC = 5.0   # within this of the end → it just finished
 STALL_MAX_FAILURES = 4       # consecutive failed restarts before giving up
+# A session hands over its bytes in one burst, then dies. The player is
+# left holding minutes of unwatched media, so wait for it to drain before
+# reopening — and reopen where the downloaded media actually ends.
+STALL_BUFFER_MARGIN_SEC = 2.0   # within this of the downloaded end → drained
+STALL_WAIT_MAX_SEC = 180.0      # stop waiting (player paused / idle)
 
 # Recommendation sidebar (Tab inside ffplay-yt). On by default — set
 # SIDEBAR_RECS=0 to disable if it ever causes regressions.
@@ -460,15 +465,21 @@ class LivePlayer:
         and ffplay stays alive, so wait() never returns.
 
         The signal is the tmpfile going quiet — no new bytes for
-        STALL_TIMEOUT_SEC. The playhead is NOT usable for this: once the
+        STALL_TIMEOUT_SEC. The playhead is NOT usable for that: once the
         file stops growing, ffplay keeps running its master clock while
         it drains whatever is buffered, so POS keeps advancing and would
         reset any "is it still moving?" timer forever.
 
-        Resume from the playhead as it was when data last arrived, which
-        is where the content actually ends. Everything after that was
-        buffer, so this replays a little instead of skipping the stretch
-        the clock ran past.
+        Where to resume is a second question, and the playhead answers it
+        just as badly. A session delivers its whole burst at once and then
+        dies, so "the playhead when the last byte arrived" is a second or
+        two after the resume point of the previous restart — every reopen
+        would land on the same second and loop the opening minute forever.
+        Resume where the downloaded media ends instead: `_media_end_sec()`
+        reads that off the file, and it slides forward with every burst.
+        While the player still has that media in hand a restart would only
+        throw it away, so wait for the buffer to drain first — the wall
+        often clears by itself in the meantime.
         """
         log = open(self.log_path, "a")
         def cprint(m: str) -> None:
@@ -479,6 +490,8 @@ class LivePlayer:
         last_change = time.time()
         resume_sec = self._last_pos_sec
         backoff = STALL_TIMEOUT_SEC
+        media_end: Optional[float] = None
+        waiting_since: Optional[float] = None
         try:
             while not self._shutdown.wait(STALL_POLL_SEC):
                 try:
@@ -489,6 +502,10 @@ class LivePlayer:
                     last_size = size
                     last_change = time.time()
                     resume_sec = self._last_pos_sec
+                    # Fresh bytes: the end of the media moved, re-measure
+                    # on the next stall rather than trusting this value.
+                    media_end = None
+                    waiting_since = None
                     continue
                 # A restart is already underway; its 4 MB priming wait
                 # covers the quiet period, so start counting afresh.
@@ -506,10 +523,27 @@ class LivePlayer:
                         and resume_sec >= self._duration_sec - STALL_END_MARGIN_SEC):
                     last_change = time.time()
                     continue
+                if media_end is None:
+                    measured = self._media_end_sec()
+                    media_end = measured if measured is not None else \
+                        self._last_pos_sec
+                if (self._last_pos_sec < media_end - STALL_BUFFER_MARGIN_SEC
+                        and (waiting_since is None
+                             or time.time() - waiting_since < STALL_WAIT_MAX_SEC)):
+                    if waiting_since is None:
+                        waiting_since = time.time()
+                        cprint(f"[watchdog] downloader stalled at "
+                               f"{self._last_pos_sec:.1f}s, but the media on "
+                               f"disk runs to {media_end:.1f}s — letting the "
+                               f"buffer play out before reopening")
+                    continue
+                resume_sec = media_end
                 cprint(f"[watchdog] no new data for {frozen_for:.0f}s "
-                       f"(last data at {resume_sec:.1f}s of "
+                       f"(buffer ran to {media_end:.1f}s of "
                        f"{self._duration_sec:.1f}s, clock now "
                        f"{self._last_pos_sec:.1f}s) — reopening session")
+                waiting_since = None
+                media_end = None
                 before = self.tmpfile
                 self._restart_at(resume_sec, cprint)
                 if self.tmpfile == before:
@@ -529,6 +563,44 @@ class LivePlayer:
                 last_change = time.time()
         finally:
             log.close()
+
+    def _media_end_sec(self) -> Optional[float]:
+        """Absolute position where the bytes on disk actually stop.
+
+        `format=duration` is N/A while ffmpeg is still writing the file —
+        which is exactly when the watchdog needs the number — so read the
+        packet timestamps instead: that works on a live file. The span
+        between the first and last packet is offset by the session's start
+        position, which keeps the answer right whether the muxer wrote
+        absolute timestamps or normalised them.
+
+        Returns None if ffprobe cannot make sense of the file; the caller
+        then falls back to the playhead.
+        """
+        def packets(selector: str) -> list[float]:
+            try:
+                out = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", selector,
+                     "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+                     str(self.tmpfile)],
+                    capture_output=True, text=True, timeout=30).stdout
+            except (OSError, subprocess.SubprocessError):
+                return []
+            vals: list[float] = []
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or line == "N/A":
+                    continue
+                try:
+                    vals.append(float(line))
+                except ValueError:
+                    pass
+            return vals
+
+        pts = packets("v:0") or packets("a:0")
+        if not pts:
+            return None
+        return self._file_start_sec + max(0.0, pts[-1] - pts[0])
 
     def _handle_event(self, line: str, cprint) -> None:
         if not line: return
