@@ -142,6 +142,10 @@ STALL_TIMEOUT_SEC = 12.0     # frozen this long → assume the stream died
 STALL_POLL_SEC = 2.0         # how often to stat the tmpfile
 STALL_END_MARGIN_SEC = 5.0   # within this of the end → it just finished
 STALL_MAX_FAILURES = 4       # consecutive failed restarts before giving up
+# After a failed restart YouTube is usually rate-limiting us (status 3 /
+# 403); reopening every 24-96 s only extends the limit, so wait longer.
+STALL_FAIL_BACKOFF_MIN = 60.0
+STALL_BACKOFF_MAX = 300.0
 # A session hands over its bytes in one burst, then dies. The player is
 # left holding minutes of unwatched media, so wait for it to drain before
 # reopening — and reopen where the downloaded media actually ends.
@@ -554,7 +558,8 @@ class LivePlayer:
                                f"{self._stall_failures} failed restarts — "
                                f"press q and start the video again")
                         return
-                    backoff = min(backoff * 2, 120.0)
+                    backoff = min(max(backoff * 2, STALL_FAIL_BACKOFF_MIN),
+                                  STALL_BACKOFF_MAX)
                 else:
                     self._stall_failures = 0
                     backoff = STALL_TIMEOUT_SEC
@@ -853,6 +858,9 @@ class LivePlayer:
             if not _wait_for_min_bytes(new_tmp, 4 * 1024 * 1024, timeout=25.0):
                 cprint(f"[restart] not enough bytes from new session "
                        f"({time.time()-t0:.1f}s) — giving up")
+                # Without this the dead session keeps retrying against
+                # YouTube in the background and prolongs the rate limit.
+                self.bridge_ctrl.send("STOP_SESSION", reply_timeout=10.0)
                 try: new_tmp.unlink()
                 except Exception: pass
                 return
