@@ -209,8 +209,11 @@ def play_video(video_id: str, on_ready=None) -> int:
                 )
             except Exception as e:
                 with open(_PLAY_LOG, "a") as f:
-                    f.write(f"\n[grid] bridge_player.start failed: {e}\n")
-                return 1
+                    f.write(f"\n{time.strftime('%m-%d %H:%M:%S')} "
+                            f"[grid] bridge_player.start failed: {e}\n")
+                # 3 = YT bot-wall (rate-limit): the grid shows a
+                # human message instead of the generic exit-1 text.
+                return 3 if "bot-wall" in str(e) else 1
 
             # Focus the new ffplay window so the user's `q` actually
             # closes it (dwm sometimes parks floating windows behind).
@@ -830,6 +833,27 @@ class SearchOverlay:
 # --- search execution -----------------------------------------------------
 
 
+def _result_quality(v: feed_mod.Video) -> int:
+    """Rank duplicate search hits for the same videoId.
+
+    Search often returns a video twice: once as a plain card with full
+    metadata, once as YT's auto-generated radio mix of it (playlistId
+    "RD…", no views/age, duration slot says "Джем"/"Mix"). The plain
+    card should win — both for display and so Enter plays just the
+    video instead of queueing the mix.
+    """
+    score = 0
+    if v.views:
+        score += 2
+    if v.age:
+        score += 1
+    if v.duration and ":" in v.duration:
+        score += 2
+    if not (v.playlist_id or "").startswith("RD"):
+        score += 1
+    return score
+
+
 def run_search(query: str) -> tuple[list[feed_mod.Video], list[str]]:
     """Run a TVHTML5 search and flatten the result into a feed snapshot."""
     with innertube.InnerTube() as it:
@@ -838,12 +862,17 @@ def run_search(query: str) -> tuple[list[feed_mod.Video], list[str]]:
     videos: list[feed_mod.Video] = []
     shelf_of: list[str] = []
     label = f"Поиск: {query}"
-    seen: set[str] = set()
+    seen: dict[str, int] = {}  # video_id → index in `videos`
     for sh in parsed.shelves:
         for v in sh.videos:
-            if v.video_id in seen:
+            at = seen.get(v.video_id)
+            if at is not None:
+                # Duplicate — keep the first slot but swap in this copy
+                # if it carries better metadata.
+                if _result_quality(v) > _result_quality(videos[at]):
+                    videos[at] = v
                 continue
-            seen.add(v.video_id)
+            seen[v.video_id] = len(videos)
             videos.append(v)
             shelf_of.append(sh.title.strip() or label)
     return videos, shelf_of
@@ -1164,9 +1193,17 @@ def main() -> int:
                             pass
 
                     if rc != 0:
-                        sys.stderr.write(
-                            f"\n[grid] play_video failed (exit {rc}). "
-                            f"See {_PLAY_LOG} for details. Press any key.\n")
+                        if rc == 3:
+                            sys.stderr.write(
+                                "\n[grid] YouTube временно блокирует "
+                                "запросы (бот-стена). Это пройдёт само — "
+                                "подождите 5-30 минут или смените прокси "
+                                "и попробуйте снова. Press any key.\n")
+                        else:
+                            sys.stderr.write(
+                                f"\n[grid] play_video failed (exit {rc}). "
+                                f"See {_PLAY_LOG} for details. "
+                                f"Press any key.\n")
                         sys.stderr.flush()
                         keys.suspend()
                         try:
