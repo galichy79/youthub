@@ -132,6 +132,13 @@ SEEK_SAFETY_BYTES = 2 * 1024 * 1024
 # pointless restart cascades.
 SEEK_COOLDOWN_SEC = 0.5
 
+# How long a measured byte↔time map for the tmpfile stays valid. The
+# measurement is one ffprobe pass over a file that can reach 250 MB, so
+# it cannot run on every arrow press; the file also grows in bursts, so
+# a second-old answer is still right about where the media ends —
+# SEEK_SAFETY_BYTES of margin covers the rest.
+MEDIA_SPAN_TTL_SEC = 1.0
+
 # Stall watchdog. The SABR stream can die silently mid-video (YouTube
 # escalates stream protection to "attestation required" and googlevideo
 # throws): ffmpeg stops writing, ffplay freezes on the last frame, and
@@ -310,6 +317,14 @@ class LivePlayer:
     _last_pos_sec: float = 0.0
     _file_start_sec: float = 0.0
     _last_seek_at: float = 0.0
+    # Cached (first_pts, last_pts, monotonic) of the current tmpfile —
+    # the byte↔time map the seek decision needs. Invalidated whenever
+    # the file is swapped, refreshed by `_media_span_abs`.
+    _media_span: Optional[tuple[float, float, float]] = None
+    # The latest arrow press that arrived while a restart was in flight.
+    # Without this the press is gone for good and the user ends up
+    # somewhere they did not ask for.
+    _pending_delta_sec: Optional[float] = None
     # Video length, taken from the bridge's START_SESSION reply. 0 until
     # known; the stall watchdog treats 0 as "unknown" and stays cautious.
     _duration_sec: float = 0.0
@@ -582,18 +597,22 @@ class LivePlayer:
         finally:
             log.close()
 
-    def _media_end_sec(self) -> Optional[float]:
-        """Absolute position where the bytes on disk actually stop.
+    def _probe_pts_span(self) -> Optional[tuple[float, float]]:
+        """First and last packet PTS in the tmpfile, in the file's own
+        timeline.
 
         `format=duration` is N/A while ffmpeg is still writing the file —
-        which is exactly when the watchdog needs the number — so read the
-        packet timestamps instead: that works on a live file. The span
-        between the first and last packet is offset by the session's start
-        position, which keeps the answer right whether the muxer wrote
-        absolute timestamps or normalised them.
+        which is exactly when the numbers are needed — so read the packet
+        timestamps instead: that works on a live file. Audio is only a
+        fallback for the first moments of a session, before the video
+        stream has produced a packet.
 
-        Returns None if ffprobe cannot make sense of the file; the caller
-        then falls back to the playhead.
+        Both ends are returned raw. The seek decision compares them
+        against POS, which is read out of this same file, so the two
+        always share a timebase — whether the muxer wrote absolute or
+        normalised timestamps is irrelevant to that comparison.
+
+        Returns None if ffprobe cannot make sense of the file.
         """
         def packets(selector: str) -> list[float]:
             try:
@@ -618,7 +637,32 @@ class LivePlayer:
         pts = packets("v:0") or packets("a:0")
         if not pts:
             return None
-        return self._file_start_sec + max(0.0, pts[-1] - pts[0])
+        return pts[0], pts[-1]
+
+    def _media_span_abs(self) -> Optional[tuple[float, float]]:
+        """Cached `_probe_pts_span()` — the keypress path must not pay
+        for a full scan of a 250 MB file on every arrow press."""
+        now = time.monotonic()
+        cached = self._media_span
+        if cached is not None and now - cached[2] < MEDIA_SPAN_TTL_SEC:
+            return cached[0], cached[1]
+        span = self._probe_pts_span()
+        if span is None:
+            return None
+        self._media_span = (span[0], span[1], now)
+        return span
+
+    def _media_end_sec(self) -> Optional[float]:
+        """Absolute position where the bytes on disk actually stop.
+
+        The span between the first and last packet is offset by the
+        session's start position, which keeps the answer right whether
+        the muxer wrote absolute timestamps or normalised them.
+        """
+        span = self._probe_pts_span()
+        if span is None:
+            return None
+        return self._file_start_sec + max(0.0, span[1] - span[0])
 
     def _handle_event(self, line: str, cprint) -> None:
         if not line: return
@@ -772,7 +816,7 @@ class LivePlayer:
                 self._send_ipc(f"SPONSOR_SKIP {cat} {end - pos:.2f}")
             except Exception:
                 pass
-            self._handle_seek_req(end - pos, cprint)
+            self._handle_seek_req(end - pos, cprint, user_press=False)
             return
         # Outside all segments — clear the "just skipped" marker so
         # the next time we enter one (after a backward seek, say) we
@@ -782,15 +826,27 @@ class LivePlayer:
 
     # ---- seek decision ----
 
-    def _handle_seek_req(self, delta_sec: float, cprint) -> None:
+    def _handle_seek_req(self, delta_sec: float, cprint,
+                         user_press: bool = True) -> None:
         # Drop the request entirely if another seek is in flight.
         # `_restart_lock.locked()` catches the longer big-jump path;
         # the cooldown catches small in-file seeks plus an accidental
         # double-press right after a restart finishes.
         now = time.monotonic()
         if self._restart_lock.locked():
+            # A restart takes 6-11 s, and a user who presses an arrow
+            # again during it means "carry on from wherever that lands",
+            # so keep the latest intent instead of discarding it — with
+            # 0.5 s cooldowns the old code threw away whole bursts and
+            # left the playhead somewhere the user never asked for.
+            # SponsorBlock skips are excluded: theirs is a distance to a
+            # segment end, not a relative nudge, so replaying it from the
+            # new position would overshoot.
+            if user_press:
+                self._pending_delta_sec = delta_sec
             cprint(f"[controller] SEEK_REQ_REL {delta_sec:+.1f}  "
-                   f"IGNORED (restart in progress)")
+                   f"IGNORED (restart in progress, "
+                   f"pending={self._pending_delta_sec})")
             return
         if now - self._last_seek_at < SEEK_COOLDOWN_SEC:
             cprint(f"[controller] SEEK_REQ_REL {delta_sec:+.1f}  "
@@ -801,19 +857,38 @@ class LivePlayer:
         target = max(0.0, self._last_pos_sec + delta_sec)
         try: size = self.tmpfile.stat().st_size
         except FileNotFoundError: size = 0
-        played_in_file = max(self._last_pos_sec - self._file_start_sec, 1.0)
-        bytes_per_sec = (size / played_in_file) if size > 0 else 0
-        target_offset_sec = target - self._file_start_sec
-        target_bytes = target_offset_sec * bytes_per_sec if bytes_per_sec > 0 else 0
+
+        # How much MEDIA is on disk decides this, not how much the user
+        # has played. A SABR session delivers its whole burst at once, so
+        # the file always holds far more media than the playhead has
+        # reached; dividing by the played span inflated bytes_per_sec by
+        # exactly that ratio, which collapsed `target_bytes < size` into
+        # `target < pos` — a condition that can never accept a forward
+        # seek at any file size. That was the forward-seek bug.
+        span = self._media_span_abs()
+        if span is not None:
+            origin = span[0]
+            downloaded_sec = span[1] - span[0]
+        else:
+            # File not readable yet. Fall back to the playhead estimate:
+            # it is conservative (it under-reports the media on disk), so
+            # the worst case is one unnecessary restart, never a seek
+            # past the writer's edge.
+            origin = self._file_start_sec
+            downloaded_sec = self._last_pos_sec - self._file_start_sec
+        target_rel = target - origin
+        bytes_per_sec = (size / downloaded_sec
+                         if size > 0 and downloaded_sec > 0 else 0)
+        target_bytes = target_rel * bytes_per_sec
         in_range = (
-            target >= self._file_start_sec
+            target_rel > 0
             and target_bytes > 0
             and target_bytes < size - SEEK_SAFETY_BYTES
         )
         cprint(
             f"[controller] SEEK_REQ_REL {delta_sec:+.1f}  "
             f"pos={self._last_pos_sec:.1f}  target={target:.1f}  "
-            f"fileStart={self._file_start_sec:.1f}  "
+            f"origin={origin:.1f}  downloaded={downloaded_sec:.1f}s  "
             f"file={size/1024/1024:.1f}MB  bps={bytes_per_sec/1024:.0f}KB/s  "
             f"in_range={in_range}"
         )
@@ -825,6 +900,18 @@ class LivePlayer:
                 daemon=True, name="bridge_player.restart",
             ).start()
 
+    def _replay_pending_seek(self, cprint) -> None:
+        """Apply the arrow press that arrived while a restart was running.
+
+        Called once the new session is open, so the delta lands relative
+        to where the user actually is now.
+        """
+        delta, self._pending_delta_sec = self._pending_delta_sec, None
+        if delta is None:
+            return
+        cprint(f"[restart]   replaying queued seek {delta:+.1f}")
+        self._handle_seek_req(delta, cprint)
+
     # ---- restart workflow ----
 
     def _restart_at(self, target_sec: float, cprint) -> None:
@@ -832,6 +919,7 @@ class LivePlayer:
             cprint(f"[restart] skipped (already in progress) "
                    f"target={target_sec:.1f}s")
             return
+        opened = False
         try:
             cprint(f"[restart] BEGIN -> {target_sec:.1f}s")
             t0 = time.time()
@@ -886,10 +974,19 @@ class LivePlayer:
             self.tmpfile = new_tmp
             self._last_pos_sec = target_sec
             self._file_start_sec = target_sec
+            # The map measured for the old file says nothing about this
+            # one — different mux run, different byte layout.
+            self._media_span = None
             self._send_ipc(f"OPEN {new_tmp}")
+            opened = True
             cprint(f"[restart] DONE OPEN {new_tmp} ({time.time()-t0:.1f}s)")
         finally:
             self._restart_lock.release()
+            # Only on success: a refused restart must not re-trigger the
+            # seek that was waiting on it, or a rate-limited bridge would
+            # be hammered in a loop.
+            if opened:
+                self._replay_pending_seek(cprint)
 
 
 # ---------------------------------------------------------------------------
