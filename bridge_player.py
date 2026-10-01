@@ -139,6 +139,14 @@ SEEK_COOLDOWN_SEC = 0.5
 # SEEK_SAFETY_BYTES of margin covers the rest.
 MEDIA_SPAN_TTL_SEC = 1.0
 
+# The progress bar wants to know where the download got to four times a
+# second — far too often to run the packet scan behind `_media_end_sec`.
+# So calibrate bytes-per-media-second once and scale the (free) file
+# size in between. Being a few percent out is invisible on a bar.
+BPS_MIN_BYTES = 2 * 1024 * 1024    # a header plus a packet or two proves nothing
+BPS_RECALIB_SEC = 20.0             # don't rescan more often than this
+BPS_RESCAN_GROWTH = 1.5            # ...unless the file grew by half since
+
 # Stall watchdog. The SABR stream can die silently mid-video (YouTube
 # escalates stream protection to "attestation required" and googlevideo
 # throws): ffmpeg stops writing, ffplay freezes on the last frame, and
@@ -328,6 +336,14 @@ class LivePlayer:
     # Video length, taken from the bridge's START_SESSION reply. 0 until
     # known; the stall watchdog treats 0 as "unknown" and stays cautious.
     _duration_sec: float = 0.0
+    # Progress-bar feed (`_push_meta`): bytes per media second, measured
+    # off a packet scan and then reused — see `_downloaded_sec`. Tied to
+    # the tmpfile it was measured on, since a hot-swap OPEN starts a new
+    # file with its own origin.
+    _bps: float = 0.0
+    _bps_size: int = 0
+    _bps_at: float = 0.0
+    _bps_file: Optional[Path] = None
     _stall_failures: int = 0
     # SponsorBlock segments: (start_sec, end_sec, category) sorted by start.
     # Auto-skip triggered when playhead enters a segment.
@@ -664,6 +680,53 @@ class LivePlayer:
             return None
         return self._file_start_sec + max(0.0, span[1] - span[0])
 
+    def _downloaded_sec(self) -> float:
+        """Media second the bytes on disk reach — the bar's download layer.
+
+        `_media_end_sec()` answers this exactly, but it pays for an
+        ffprobe scan of the whole file: 0.1 s while the file is fresh,
+        seconds once it is large, and the bar is fed four times a second.
+        So calibrate bytes-per-media-second off a scan, then scale the
+        `stat()` size, which is free. Precision is a few percent — plenty
+        for a bar, unlike paying seconds of CPU for it.
+
+        Returns 0.0 while the file is too small to calibrate against.
+        """
+        try:
+            size = self.tmpfile.stat().st_size
+        except OSError:
+            return 0.0
+        now = time.monotonic()
+        stale = (self._bps <= 0.0
+                 or self._bps_file != self.tmpfile
+                 or (now - self._bps_at >= BPS_RECALIB_SEC
+                     and size >= self._bps_size * BPS_RESCAN_GROWTH))
+        if stale and size >= BPS_MIN_BYTES:
+            span = self._probe_pts_span()
+            if span is not None and span[1] > span[0]:
+                self._bps = size / (span[1] - span[0])
+                self._bps_size = size
+                self._bps_at = now
+                self._bps_file = self.tmpfile
+        if self._bps <= 0.0 or self._bps_file != self.tmpfile:
+            return 0.0
+        return self._file_start_sec + size / self._bps
+
+    def _push_meta(self) -> None:
+        """Feed the player's progress bar: total length + download extent.
+
+        Rides the POS feed, so the bar tracks the playhead at the same
+        4 Hz. The length is a cached number and the extent is a stat()
+        except on the ticks that refresh the calibration. Both are
+        absolute media seconds, the same frame POS is reported in.
+        """
+        if self._duration_sec <= 0.0:
+            return
+        downloaded = self._downloaded_sec()
+        if downloaded <= 0.0:
+            downloaded = self._last_pos_sec
+        self._send_ipc(f"META {self._duration_sec:.3f} {downloaded:.3f}")
+
     def _handle_event(self, line: str, cprint) -> None:
         if not line: return
         if line.startswith("POS "):
@@ -674,6 +737,7 @@ class LivePlayer:
                 # `_file_start_sec` for seek decisions.
                 self._last_pos_sec = float(line[4:])
             except ValueError: pass
+            self._push_meta()
             self._check_sponsor_skip(cprint)
             return
         if line.startswith("SEEK_REQ_REL "):
