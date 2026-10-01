@@ -492,10 +492,10 @@ class LivePlayer:
 
         last_size = -1
         last_change = time.time()
-        resume_sec = self._last_pos_sec
         backoff = STALL_TIMEOUT_SEC
         media_end: Optional[float] = None
         waiting_since: Optional[float] = None
+        end_logged = False
         try:
             while not self._shutdown.wait(STALL_POLL_SEC):
                 try:
@@ -505,11 +505,11 @@ class LivePlayer:
                 if size != last_size:
                     last_size = size
                     last_change = time.time()
-                    resume_sec = self._last_pos_sec
                     # Fresh bytes: the end of the media moved, re-measure
                     # on the next stall rather than trusting this value.
                     media_end = None
                     waiting_since = None
+                    end_logged = False
                     continue
                 # A restart is already underway; its 4 MB priming wait
                 # covers the quiet period, so start counting afresh.
@@ -519,18 +519,30 @@ class LivePlayer:
                 frozen_for = time.time() - last_change
                 if frozen_for < backoff:
                     continue
-                # Distinguish "the stream died" from "the whole video is
-                # already on disk". A finished download stops growing at
-                # the end of the video, so the guard below skips it; a
-                # dead stream stops well short of the end.
-                if (self._duration_sec > 0
-                        and resume_sec >= self._duration_sec - STALL_END_MARGIN_SEC):
-                    last_change = time.time()
-                    continue
                 if media_end is None:
                     measured = self._media_end_sec()
                     media_end = measured if measured is not None else \
                         self._last_pos_sec
+                # Distinguish "the stream died" from "the whole video is
+                # already on disk" by where the bytes stop, not by the
+                # playhead. A session delivers its entire burst at once,
+                # so when the file goes quiet the playhead is still near
+                # the start even when the download reached the end of the
+                # video; and while the buffer drains the playhead keeps
+                # advancing regardless, so it cannot answer this at all.
+                # Asking the playhead instead of the file is what made a
+                # finished video look like a dead stream, and sent the
+                # watchdog to reopen a session at the very last second.
+                if (self._duration_sec > 0
+                        and media_end >= self._duration_sec - STALL_END_MARGIN_SEC):
+                    if not end_logged:
+                        end_logged = True
+                        cprint(f"[watchdog] media on disk already reaches "
+                               f"the end ({media_end:.1f}s of "
+                               f"{self._duration_sec:.1f}s) — nothing to "
+                               f"reopen")
+                    last_change = time.time()
+                    continue
                 if (self._last_pos_sec < media_end - STALL_BUFFER_MARGIN_SEC
                         and (waiting_since is None
                              or time.time() - waiting_since < STALL_WAIT_MAX_SEC)):
@@ -541,15 +553,16 @@ class LivePlayer:
                                f"disk runs to {media_end:.1f}s — letting the "
                                f"buffer play out before reopening")
                     continue
-                resume_sec = media_end
                 cprint(f"[watchdog] no new data for {frozen_for:.0f}s "
                        f"(buffer ran to {media_end:.1f}s of "
                        f"{self._duration_sec:.1f}s, clock now "
                        f"{self._last_pos_sec:.1f}s) — reopening session")
                 waiting_since = None
-                media_end = None
                 before = self.tmpfile
-                self._restart_at(resume_sec, cprint)
+                self._restart_at(media_end, cprint)
+                # The new session may deliver more: re-measure next time.
+                media_end = None
+                end_logged = False
                 if self.tmpfile == before:
                     # Bridge refused. Back off rather than hammering it.
                     self._stall_failures += 1
