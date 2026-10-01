@@ -152,10 +152,11 @@ static double sponsor_anim_skipped_sec = 0.0;
  * and the elapsed / total timecodes.
  *
  * It is passive (it reports, it doesn't prompt), so it hides itself:
- * armed by a seek, a pause or the first frames of a stream, held for
- * BAR_ANIM_DURATION_SEC and faded out at the end. It spans the video
- * area only — the same x offset the other overlays use — so it never
- * collides with the recommendations column.
+ * armed by a seek, a pause, the pointer resting in the bottom strip, or
+ * the first frames of a stream; held for BAR_ANIM_DURATION_SEC and faded
+ * out at the end. It spans the video area only — the same x offset the
+ * other overlays use — so it never collides with the recommendations
+ * column.
  *
  * Duration and download extent arrive over IPC (META) from
  * bridge_player: the player cannot derive either one. The matroska
@@ -168,8 +169,14 @@ static double bar_anim_start_sec     = -1.0;
 static double bar_duration_sec       = 0.0;  /* from META; 0 = unknown */
 static double bar_buffered_sec       = 0.0;  /* from META; 0 = unknown */
 static int    bar_announced          = 0;    /* first frames seen */
+/* Pointer resting in the bottom strip of the video area. Set from the
+ * SDL_MOUSEMOTION handler. A *stationary* mouse sends no motion events
+ * at all, so the readout is kept up by pinning the timer in
+ * update_progress_bar() rather than by waiting for fresh events. */
+static int    bar_hover              = 0;
 #define BAR_ANIM_DURATION_SEC 3.0
 #define BAR_FADE_FROM         0.75  /* fraction of the span spent fading */
+#define BAR_HOVER_ZONE_H      90    /* hover strip height, px */
 
 static int  update_sidebar_offset(void);  /* returns 1 while animating */
 static int  update_speed_overlay(void);   /* returns 1 while overlay visible */
@@ -1822,6 +1829,16 @@ static void trigger_progress_bar(void) {
 }
 
 static int update_progress_bar(void) {
+    /* Held open by the pointer. Pin the timer instead of asking for a
+     * redraw: the readout is already on screen, and re-rendering it at
+     * the loop's rate while the mouse just sits there would burn CPU for
+     * a picture that is not changing. Pinning here (rather than in the
+     * draw) keeps the fade maths and the "is it showing" question on one
+     * number. */
+    if (bar_hover) {
+        bar_anim_start_sec = anim_now_sec();
+        return 0;
+    }
     if (bar_anim_start_sec < 0.0) return 0;
     if (anim_now_sec() - bar_anim_start_sec >= BAR_ANIM_DURATION_SEC) {
         bar_anim_start_sec = -1.0;
@@ -4664,6 +4681,7 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     bar_duration_sec   = 0.0;
     bar_buffered_sec   = 0.0;
     bar_announced      = 0;
+    bar_hover          = 0;
 
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
@@ -5097,6 +5115,27 @@ static void event_loop(VideoState *cur_stream)
                 cursor_hidden = 0;
             }
             cursor_last_shown = av_gettime_relative();
+            /* Hover over the bottom strip of the video area asks for the
+             * progress bar. This has to sit above the right-drag guard
+             * below — that guard exists for mouse *seeking*, and would
+             * otherwise swallow every plain motion event. */
+            if (cur_stream) {
+                int in_zone =
+                    event.motion.y >= cur_stream->height - BAR_HOVER_ZONE_H
+                    && event.motion.x >= sidebar_offset_px;
+                if (in_zone && !bar_hover) {
+                    bar_hover = 1;
+                    trigger_progress_bar();
+                    cur_stream->force_refresh = 1;
+                } else if (!in_zone && bar_hover) {
+                    bar_hover = 0;
+                    /* Put the timer at the start of the fade: the readout
+                     * should not outstay the pointer by the full hold. */
+                    bar_anim_start_sec = anim_now_sec()
+                        - BAR_ANIM_DURATION_SEC * BAR_FADE_FROM;
+                    cur_stream->force_refresh = 1;
+                }
+            }
             if (event.type == SDL_MOUSEBUTTONDOWN) {
                 if (event.button.button != SDL_BUTTON_RIGHT)
                     break;
