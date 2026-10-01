@@ -147,6 +147,30 @@ static char   sponsor_anim_category[32] = {0};
 static double sponsor_anim_skipped_sec = 0.0;
 #define SPONSOR_ANIM_DURATION_SEC 1.6
 
+/* Progress bar: a readout along the bottom of the video area showing
+ * how much of the video has played, how much of it is already on disk
+ * and the elapsed / total timecodes.
+ *
+ * It is passive (it reports, it doesn't prompt), so it hides itself:
+ * armed by a seek, a pause or the first frames of a stream, held for
+ * BAR_ANIM_DURATION_SEC and faded out at the end. It spans the video
+ * area only — the same x offset the other overlays use — so it never
+ * collides with the recommendations column.
+ *
+ * Duration and download extent arrive over IPC (META) from
+ * bridge_player: the player cannot derive either one. The matroska
+ * file is still being written, so its container duration reads N/A,
+ * and how far ahead of the playhead the bytes run is only visible to
+ * whoever is watching the file's size. A SABR session hands over
+ * bursts of ~60 s, so the downloaded layer usually sits well ahead of
+ * the playhead — which is the whole point of drawing it. */
+static double bar_anim_start_sec     = -1.0;
+static double bar_duration_sec       = 0.0;  /* from META; 0 = unknown */
+static double bar_buffered_sec       = 0.0;  /* from META; 0 = unknown */
+static int    bar_announced          = 0;    /* first frames seen */
+#define BAR_ANIM_DURATION_SEC 3.0
+#define BAR_FADE_FROM         0.75  /* fraction of the span spent fading */
+
 static int  update_sidebar_offset(void);  /* returns 1 while animating */
 static int  update_speed_overlay(void);   /* returns 1 while overlay visible */
 static int  update_seek_overlay(void);
@@ -159,6 +183,13 @@ static void trigger_seek_overlay(double delta_sec);
 static void trigger_sponsor_overlay(const char *category,
                                     double skipped_sec);
 static void start_sidebar_anim(int to_open);
+static int  update_progress_bar(void);
+static void draw_progress_bar(struct VideoState *is, int video_x);
+static void trigger_progress_bar(void);
+/* Declared here, defined with the clock helpers far below: the progress
+ * bar needs the master clock, and video_display — which polls the bar —
+ * sits above those definitions. */
+static double get_master_clock(struct VideoState *is);
 /* === end visual animations === */
 
 #include "libavutil/avstring.h"
@@ -1331,9 +1362,9 @@ static void draw_chevron(int cx, int cy, int half_w, int half_h,
 }
 
 /* 3×5 pixel glyphs. One byte per row, low 3 bits = columns left→right.
- * Used by the speed / seek / sponsor overlays so we don't have to drag
- * SDL_ttf into the build. */
-static const uint8_t SPEED_GLYPH[16][5] = {
+ * Used by the speed / seek / sponsor overlays and the progress bar so
+ * we don't have to drag SDL_ttf into the build. */
+static const uint8_t SPEED_GLYPH[18][5] = {
     { 0x7,0x5,0x5,0x5,0x7 }, /* 0 */
     { 0x2,0x6,0x2,0x2,0x7 }, /* 1 */
     { 0x7,0x1,0x7,0x4,0x7 }, /* 2 */
@@ -1350,6 +1381,8 @@ static const uint8_t SPEED_GLYPH[16][5] = {
     { 0x0,0x0,0x7,0x0,0x0 }, /* - */
     { 0x3,0x4,0x2,0x1,0x6 }, /* s */
     { 0x0,0x0,0x0,0x0,0x0 }, /* space */
+    { 0x0,0x2,0x0,0x2,0x0 }, /* : — timecodes */
+    { 0x1,0x1,0x2,0x4,0x4 }, /* / — separator between the two timecodes */
 };
 
 static int speed_glyph_index(char c) {
@@ -1359,6 +1392,8 @@ static int speed_glyph_index(char c) {
     if (c == '+') return 12;
     if (c == '-') return 13;
     if (c == 's' || c == 'S') return 14;
+    if (c == ':') return 16;
+    if (c == '/') return 17;
     return 15;  /* space / unknown */
 }
 
@@ -1775,6 +1810,131 @@ static void update_recs_focus(int new_focus, int win_h)
     if (bot_px > win_h - TILE_MARGIN)
         recs_scroll_px += bot_px - (win_h - TILE_MARGIN);
     if (recs_scroll_px < 0) recs_scroll_px = 0;
+}
+
+/* ---- progress bar ----
+ * Passive readout, so unlike the speed / seek overlays it only fades:
+ * no slide, no overshoot, nothing to look at twice. Position is the
+ * master clock; the total and the downloaded extent come from the
+ * controller (see the state block near the top of the file). */
+static void trigger_progress_bar(void) {
+    bar_anim_start_sec = anim_now_sec();
+}
+
+static int update_progress_bar(void) {
+    if (bar_anim_start_sec < 0.0) return 0;
+    if (anim_now_sec() - bar_anim_start_sec >= BAR_ANIM_DURATION_SEC) {
+        bar_anim_start_sec = -1.0;
+        return 0;
+    }
+    return 1;
+}
+
+/* "12:34", or "1:05:03" once the video passes the hour. */
+static void fmt_timecode(char *buf, size_t n, double sec) {
+    int t = (sec > 0.0) ? (int)(sec + 0.5) : 0;
+    int h = t / 3600;
+    int m = (t % 3600) / 60;
+    int s = t % 60;
+    if (h > 0)
+        snprintf(buf, n, "%d:%02d:%02d", h, m, s);
+    else
+        snprintf(buf, n, "%d:%02d", m, s);
+}
+
+static void draw_progress_bar(VideoState *is, int video_x) {
+    if (bar_anim_start_sec < 0.0) return;
+    double t = (anim_now_sec() - bar_anim_start_sec) / BAR_ANIM_DURATION_SEC;
+    if (t < 0.0 || t > 1.0) return;
+    double alpha = 1.0;
+    if (t > BAR_FADE_FROM)
+        alpha = 1.0 - (t - BAR_FADE_FROM) / (1.0 - BAR_FADE_FROM);
+    if (alpha <= 0.0) return;
+
+    double pos = get_master_clock(is);
+    if (isnan(pos) || pos < 0.0) pos = 0.0;
+
+    /* The controller's number is authoritative — it comes from the
+     * playerResponse. A plain local file, played with no controller and
+     * therefore no META, still gets a bar off the container duration. */
+    double dur = bar_duration_sec;
+    if (dur <= 0.0 && is->ic && is->ic->duration > 0)
+        dur = is->ic->duration / (double)AV_TIME_BASE;
+    if (dur <= 0.0) return;      /* nothing to scale the bar against */
+    if (pos > dur) pos = dur;
+
+    /* The clock can run a hair past the last download report. */
+    double downloaded = bar_buffered_sec;
+    if (downloaded < pos) downloaded = pos;
+    if (downloaded > dur) downloaded = dur;
+
+    int win_w = is->width;
+    int win_h = is->height;
+
+    char caption[48], elapsed[24], total[16];
+    fmt_timecode(elapsed, sizeof(elapsed), pos);
+    fmt_timecode(total, sizeof(total), dur);
+    snprintf(caption, sizeof(caption), "%s / %s", elapsed, total);
+
+    int scale = 2;
+    int text_h = 5 * scale;
+    int bar_h  = 5;
+    int margin = 14;
+    int gap    = 14;
+
+    int bar_x = video_x + margin;
+    int bar_w = win_w - video_x - 2 * margin;
+    int row_bottom = win_h - margin;
+    int row_top = row_bottom - text_h;
+
+    /* The timecodes take their width off the right end of the row, the
+     * bar takes what is left. On a narrow window the text goes first —
+     * a bar with no length to it tells the viewer nothing. */
+    int text_w = (int)strlen(caption) * 4 * scale - scale;
+    int show_text = (bar_w - text_w - gap >= 60);
+    if (show_text) bar_w -= text_w + gap;
+    if (bar_w < 40) return;
+
+    int bar_y = row_top + (text_h - bar_h) / 2;
+
+    SDL_BlendMode prev_bm;
+    SDL_GetRenderDrawBlendMode(renderer, &prev_bm);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    /* Same dark card the other overlays sit on, so the readout stays
+     * legible over a bright frame. */
+    SDL_Rect plate = { bar_x - 8, row_top - 5,
+                       bar_w + (show_text ? text_w + gap : 0) + 16,
+                       text_h + 10 };
+    SDL_SetRenderDrawColor(renderer, 16, 18, 24, (Uint8)(alpha * 200));
+    SDL_RenderFillRect(renderer, &plate);
+
+    /* Three layers: track (not downloaded), downloaded (on disk, not
+     * played yet) and played. The middle one is the reason this bar
+     * exists at all — the download runs far ahead of the playhead. */
+    SDL_Rect r_track = { bar_x, bar_y, bar_w, bar_h };
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, (Uint8)(alpha * 45));
+    SDL_RenderFillRect(renderer, &r_track);
+
+    int dl_w = (int)(bar_w * (downloaded / dur) + 0.5);
+    if (dl_w > 0) {
+        SDL_Rect r_dl = { bar_x, bar_y, dl_w, bar_h };
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, (Uint8)(alpha * 105));
+        SDL_RenderFillRect(renderer, &r_dl);
+    }
+
+    int pos_w = (int)(bar_w * (pos / dur) + 0.5);
+    if (pos_w < 2) pos_w = 2;   /* keep the first second visible */
+    if (pos_w > bar_w) pos_w = bar_w;
+    SDL_Rect r_pos = { bar_x, bar_y, pos_w, bar_h };
+    SDL_SetRenderDrawColor(renderer, 90, 200, 255, (Uint8)(alpha * 235));
+    SDL_RenderFillRect(renderer, &r_pos);
+
+    if (show_text)
+        draw_speed_text(bar_x + bar_w + gap, row_top, scale, caption,
+                        235, 245, 255, (Uint8)(alpha * 255));
+
+    SDL_SetRenderDrawBlendMode(renderer, prev_bm);
 }
 
 /* Render recommendation tiles into the left sidebar. Called from
@@ -2270,6 +2430,19 @@ static void video_display(VideoState *is)
     anim_pending    |= update_speed_overlay();
     anim_pending    |= update_seek_overlay();
     anim_pending    |= update_sponsor_overlay();
+    anim_pending    |= update_progress_bar();
+
+    /* The opening seconds are when the viewer most wants the length of
+     * what they just started, but the bar has nothing to draw until
+     * there is both a clock and a duration — so wait for both, then
+     * announce it once. A new stream resets the flag (stream_open). */
+    if (!bar_announced && bar_duration_sec > 0.0) {
+        double m0 = get_master_clock(is);
+        if (!isnan(m0) && m0 > 0.0) {
+            bar_announced = 1;
+            trigger_progress_bar();
+        }
+    }
 
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
@@ -2300,6 +2473,7 @@ static void video_display(VideoState *is)
     draw_speed_overlay(is->width, is->height, sidebar_offset_px);
     draw_seek_overlay(is->width, is->height, sidebar_offset_px);
     draw_sponsor_overlay(is->width, is->height, sidebar_offset_px);
+    draw_progress_bar(is, sidebar_offset_px);
 
     SDL_RenderPresent(renderer);
 
@@ -2410,6 +2584,11 @@ static void check_external_clock_speed(VideoState *is) {
 /* seek in the stream */
 static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int seek_by_bytes)
 {
+    /* Every seek is a moment where the viewer wants to know where they
+     * landed — arm the progress bar here rather than in each caller, so
+     * arrow keys, mouse scrubbing and the controller's SEEK_ABS all
+     * report the same way. */
+    trigger_progress_bar();
     if (!is->seek_req) {
         is->seek_pos = pos;
         is->seek_rel = rel;
@@ -2439,6 +2618,10 @@ static void toggle_pause(VideoState *is)
 {
     stream_toggle_pause(is);
     is->step = 0;
+    /* Pausing is the natural way to ask "where am I?" — surface the
+     * readout. Note this is the user/IPC path only; the automatic
+     * pause in the read loop doesn't nag the viewer with a bar. */
+    trigger_progress_bar();
 }
 
 /* === ffplay-yt IPC patch — function bodies ===
@@ -2449,6 +2632,7 @@ static void toggle_pause(VideoState *is)
  *     SEEK_ABS <seconds>        # jump to absolute time
  *     SEEK_REL <delta_seconds>  # negative = backward
  *     TOGGLE_PAUSE
+ *     META <duration_sec> <downloaded_sec>   # feeds the progress bar
  *     QUIT
  *
  *   ffplay-yt → client:
@@ -2515,6 +2699,18 @@ static int ipc_handle_command(VideoState *unused_is, const char *line)
             pthread_mutex_unlock(&ipc_open_mtx);
             SDL_Event ev = { .type = SDL_USEREVENT };
             SDL_PushEvent(&ev);
+        }
+    } else if (!strncmp(line, "META ", 5)) {
+        /* <duration_sec> <downloaded_sec> — the progress bar's two
+         * numbers, both absolute media seconds. The player only draws
+         * them; it cannot derive them (see the bar state block).
+         * Written from this thread and read by video_display on the
+         * main thread — doubles, never used as a pair, so a racing
+         * read can at worst show the previous value for one frame. */
+        double d = 0.0, b = 0.0;
+        if (sscanf(line + 5, "%lf %lf", &d, &b) == 2) {
+            bar_duration_sec = (d > 0.0) ? d : 0.0;
+            bar_buffered_sec = (b > 0.0) ? b : 0.0;
         }
     } else if (!strcmp(line, "QUIT")) {
         SDL_Event ev = { .type = SDL_QUIT };
@@ -4437,6 +4633,14 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     is->iformat = iformat;
     is->ytop    = 0;
     is->xleft   = 0;
+
+    /* A new VideoState is a new video (first play, or the hot-swap a
+     * forward seek past the downloaded part performs), so the progress
+     * bar starts over: it re-announces once the fresh META arrives. */
+    bar_anim_start_sec = -1.0;
+    bar_duration_sec   = 0.0;
+    bar_buffered_sec   = 0.0;
+    bar_announced      = 0;
 
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
