@@ -24,6 +24,14 @@ import { Innertube } from 'youtubei.js';
 // by yt-dlp's bgutil-pot plugin and youtubei.js — empirically stable.
 const REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
 
+// Homepage URL and the UA used both to fetch it and to fake the browser
+// inside jsdom: the page context and the snapshot must come from the
+// same identity, or the server does not match them up.
+const HOMEPAGE = 'https://www.youtube.com/';
+const REAL_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
+
 function log(msg) { process.stderr.write(`[po_token] ${msg}\n`); }
 
 // Cached session state — one BotGuard VM + integrity token covers many
@@ -49,6 +57,57 @@ async function _fetchChallengeViaInnertube() {
 }
 
 
+function _decodeEscapes(s) {
+  // The homepage carries its player config inside a JS string literal, so
+  // quotes and braces arrive as \x22 / \x7b and '&' as &.
+  return s
+    .replace(/\\x([0-9A-Fa-f]{2})/g,
+             (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\u([0-9A-Fa-f]{4})/g,
+             (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\\//g, '/');
+}
+
+function _field(text, name, valuePrefix = '') {
+  const m = text.match(new RegExp(`"${name}":"(${valuePrefix}[^"]+)"`));
+  return m ? m[1] : null;
+}
+
+// Fetch the BotGuard challenge from the YouTube *homepage* rather than
+// from InnerTube /att/get, together with that page's EVENT_ID.
+//
+// Why it matters: SABR verifies that the PO Token came from a snapshot
+// that carries the page context it was minted against. A token from an
+// InnerTube challenge has no such context, so the stream runs on the
+// cold-start allowance and dies at ~60s with stream protection status
+// 2 -> 3. Measured both ways on the same page-native challenge: without
+// EVENT_ID status 2 at ~60s, with it status 1 past 65s (PipePipeClient
+// PR #86, "use the page-native BotGuard attestation context").
+async function _fetchPageContext() {
+  const res = await fetch(HOMEPAGE, {
+    headers: { 'user-agent': REAL_UA, 'accept-language': 'en-US,en;q=0.9' },
+  });
+  if (!res.ok) throw new Error(`homepage HTTP ${res.status}`);
+  const html = await res.text();
+
+  const eventId = _field(html, 'EVENT_ID');
+  const at = html.indexOf('bgChallenge');
+  if (at < 0) throw new Error('no bgChallenge on homepage');
+  const near = _decodeEscapes(
+    html.slice(Math.max(0, at - 4000), at + 40000));
+
+  const program = _field(near, 'program');
+  const globalName = _field(near, 'globalName');
+  const interpreterUrl = _field(
+    near, 'privateDoNotAccessOrElseTrustedResourceUrlWrappedValue');
+  const challenge = _field(near, 'challenge', 'a=');
+  if (!eventId || !program || !globalName || !interpreterUrl)
+    throw new Error('homepage context incomplete '
+      + `(eventId=${!!eventId} program=${!!program} `
+      + `globalName=${!!globalName} interpreterUrl=${!!interpreterUrl})`);
+  return { eventId, program, globalName, interpreterUrl, challenge };
+}
+
 async function _runChallenge(visitorData) {
   // jsdom gives us document, navigator, requestAnimationFrame etc. that
   // BotGuard's interpreter expects. Pretending to be a real browser at
@@ -57,15 +116,12 @@ async function _runChallenge(visitorData) {
   // The default jsdom UA self-identifies as `jsdom/X.Y` — BotGuard
   // checks navigator.userAgent and silently refuses to wire up the
   // mint callback when it sees that. Override to a plausible Chrome.
-  const realUA =
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-    + '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
   const dom = new JSDOM(
     '<!DOCTYPE html><html><head></head><body></body></html>',
     {
-      url: 'https://www.youtube.com/',
-      referrer: 'https://www.youtube.com/',
-      userAgent: realUA,
+      url: HOMEPAGE,
+      referrer: HOMEPAGE,
+      userAgent: REAL_UA,
       pretendToBeVisual: true,
       runScripts: 'outside-only',
     },
@@ -74,12 +130,33 @@ async function _runChallenge(visitorData) {
   w.self = w;
   w.globalThis = w;
 
-  log('fetching challenge via InnerTube…');
-  const bgChallenge = await _fetchChallengeViaInnertube();
-  const interpreterUrl = bgChallenge.interpreter_url
-    .private_do_not_access_or_else_trusted_resource_url_wrapped_value;
-  const program = bgChallenge.program;
-  const globalName = bgChallenge.global_name;
+  let pageCtx = null;
+  try {
+    if (process.env.YOUHUB_NO_PAGE_CTX) throw new Error('disabled by YOUHUB_NO_PAGE_CTX');
+    log('fetching page-native challenge from youtube.com…');
+    pageCtx = await _fetchPageContext();
+    log(`page context ok (EVENT_ID=${pageCtx.eventId}, `
+        + `globalName=${pageCtx.globalName})`);
+  } catch (e) {
+    log(`page context unavailable (${e.message}) — `
+        + 'falling back to the InnerTube challenge');
+  }
+
+  let program, globalName, interpreterUrl;
+  if (pageCtx) {
+    ({ program, globalName, interpreterUrl } = pageCtx);
+    // BotGuard reads the page identity off the window it snapshots. With
+    // no window.yt.config_.EVENT_ID the snapshot describes a page that
+    // never existed, and SABR refuses the token after the cold start.
+    w.yt = { config_: { EVENT_ID: pageCtx.eventId } };
+  } else {
+    log('fetching challenge via InnerTube…');
+    const bgChallenge = await _fetchChallengeViaInnertube();
+    interpreterUrl = bgChallenge.interpreter_url
+      .private_do_not_access_or_else_trusted_resource_url_wrapped_value;
+    program = bgChallenge.program;
+    globalName = bgChallenge.global_name;
+  }
   log(`challenge ok (globalName=${globalName})`);
 
   log(`fetching interpreter from ${interpreterUrl.slice(0, 80)}…`);
