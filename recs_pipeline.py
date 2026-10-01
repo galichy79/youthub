@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -49,6 +50,48 @@ _HTTP: Optional[httpx.Client] = None
 
 def _log(msg: str) -> None:
     sys.stderr.write(f"[recs] {msg}\n")
+
+
+# ------------------- player-compatible image container ---------------
+# ffplay-yt is built with --disable-everything and carries neither the
+# image2 demuxer nor the mjpeg/png decoders, so it cannot open our
+# .jpg/.png tiles: load_image_texture() fails and the sidebar draws grey
+# placeholders. It *can* read mp4 — so each image is repackaged as a
+# single-frame mp4 (mpeg4 is in the build's decoder list) before the
+# path is handed over. Result is cached next to the original, so the
+# conversion cost is paid once per tile, not per launch.
+#
+# If the player is ever rebuilt with image2+mjpeg+png (see
+# План_панели_рекомендаций.md, путь Б), this stays harmless: mp4 still
+# decodes, and the original .jpg/.png remain on disk untouched.
+FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
+PLAYER_SUFFIX = ".mp4"
+
+
+def to_player_format(src: Path) -> Optional[Path]:
+    """Repackage an image as a one-frame mp4 the player can decode.
+
+    Returns None on failure, so callers can fall back to the original
+    path (the tile then shows a placeholder, as it does today).
+    """
+    dst = src.with_suffix(PLAYER_SUFFIX)
+    if dst.exists() and dst.stat().st_size > 1000:
+        return dst
+    try:
+        r = subprocess.run(
+            [FFMPEG, "-y", "-loglevel", "error", "-i", str(src),
+             "-c:v", "mpeg4", "-q:v", "2", "-frames:v", "1", str(dst)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        _log(f"player-format conversion failed for {src.name}: {e}")
+        return None
+    if r.returncode != 0 or not dst.exists() or dst.stat().st_size < 1000:
+        _log(f"player-format conversion rc={r.returncode} for {src.name}: "
+             f"{r.stderr.strip()[:160]}")
+        dst.unlink(missing_ok=True)
+        return None
+    return dst
 
 
 def _http() -> httpx.Client:
@@ -417,7 +460,13 @@ def main() -> int:
         except Exception as e:
             _log(f"render failed for {it['video_id']}: {e}")
             continue
-        print(f"RECS_ITEM {it['video_id']}\t{thumb}\t{text}", flush=True)
+        # Hand the player mp4s: it has no image demuxer/decoders (see
+        # to_player_format). Falls back to the original on failure, which
+        # is no worse than the previous behaviour.
+        thumb_play = to_player_format(thumb) or thumb
+        text_play = to_player_format(text) or text
+        print(f"RECS_ITEM {it['video_id']}\t{thumb_play}\t{text_play}",
+              flush=True)
     if next_token:
         print(f"CONTINUATION {next_token}", flush=True)
     return 0
