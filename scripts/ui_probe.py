@@ -21,6 +21,8 @@ Checks (each prints PASS/FAIL, exit code 1 if any fail):
   * Tab while paused         - panel opens (the regression above)
   * Tab after the clip ends  - panel opens (the reported symptom)
   * seek                     - progress bar appears, then hides again
+  * hover over the bottom    - bar appears, stays while the pointer rests
+                              there, fades once it leaves
 
 Needs an X session (DISPLAY) and takes window focus for the duration —
 it activates its own window to send keys to it, so expect the pointer
@@ -74,6 +76,7 @@ class Player:
         env = dict(os.environ, DISPLAY=os.environ.get("DISPLAY", ":0"))
         self.env = env
         self.sock.unlink(missing_ok=True)
+        self._pointer = self._read_pointer()
         self.proc = subprocess.Popen(
             [str(player), "-hide_banner", "-loglevel", "warning",
              "-window_title", self.title, "-x", str(WIN_W), "-y", str(WIN_H),
@@ -83,6 +86,16 @@ class Player:
         run(["xdotool", "windowactivate", "--sync", self.wid], env=env)
         run(["xdotool", "windowfocus", "--sync", self.wid], env=env)
         time.sleep(0.4)
+
+    def _read_pointer(self) -> tuple[str, str] | None:
+        out = run(["xdotool", "getmouselocation", "--shell"], env=self.env).stdout
+        x = y = None
+        for line in out.splitlines():
+            if line.startswith("X="):
+                x = line[2:]
+            elif line.startswith("Y="):
+                y = line[2:]
+        return (x, y) if x and y else None
 
     def _wait_window(self) -> str:
         for _ in range(150):
@@ -112,6 +125,12 @@ class Player:
     def key(self, name: str) -> None:
         run(["xdotool", "key", "--clearmodifiers", name], env=self.env)
 
+    def mouse(self, xf: float, yf: float) -> None:
+        """Warp the pointer to a fraction of the window (0..1)."""
+        w, h = self.geometry()
+        run(["xdotool", "mousemove", "--sync", "--window", self.wid,
+             str(int(w * xf)), str(int(h * yf))], env=self.env)
+
     def geometry(self) -> tuple[int, int]:
         out = run(["xdotool", "getwindowgeometry", self.wid],
                   env=self.env).stdout
@@ -132,6 +151,10 @@ class Player:
         if self.proc.poll() is None:
             self.proc.kill()
         self.sock.unlink(missing_ok=True)
+        # The hover checks warp the pointer; put it back where it was.
+        if self._pointer:
+            run(["xdotool", "mousemove", self._pointer[0], self._pointer[1]],
+                env=self.env)
 
 
 # ---------------------------------------------------------------- pixels
@@ -240,6 +263,41 @@ def bar_checks(player: Path, results: list) -> None:
         p.stop()
 
 
+def hover_checks(player: Path, results: list) -> None:
+    """The bar answers the pointer in the bottom strip.
+
+    The interesting case is the second one: a mouse that is not moving
+    sends no motion events, so keeping the readout up while the pointer
+    rests there cannot be driven by events — the hold has to survive on
+    its own.
+    """
+    p = Player(player, CLIP, "hover")
+    try:
+        p.ipc("META 4.000 4.000")     # duration, so the bar has a scale
+        p.mouse(0.5, 0.4)
+        time.sleep(3.6)               # let the opening announce fade away
+        visible, detail = bar_is_visible(p.shot("06_hover_away"))
+        results.append(check("bar hidden while the pointer is away",
+                             not visible, detail))
+
+        p.mouse(0.5, 0.97)            # into the bottom strip
+        time.sleep(0.5)
+        results.append(check("bar appears when the pointer enters",
+                             *bar_is_visible(p.shot("07_hover_in"))))
+
+        time.sleep(3.5)               # longer than the 3 s hold
+        results.append(check("bar stays while the pointer rests there",
+                             *bar_is_visible(p.shot("08_hover_still"))))
+
+        p.mouse(0.5, 0.4)             # leave the strip
+        time.sleep(1.5)               # the fade is 0.75 s
+        visible, detail = bar_is_visible(p.shot("09_hover_left"))
+        results.append(check("bar fades out after the pointer leaves",
+                             not visible, detail))
+    finally:
+        p.stop()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--player", type=Path, default=DEFAULT_PLAYER,
@@ -272,6 +330,7 @@ def main() -> int:
     results: list = []
     sidebar_checks(args.player, results)
     bar_checks(args.player, results)
+    hover_checks(args.player, results)
 
     print()
     failed = results.count(False)
