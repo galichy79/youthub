@@ -3024,6 +3024,7 @@ static void video_refresh(void *opaque, double *remaining_time)
 {
     VideoState *is = opaque;
     double time;
+    int redrew = 0;
 
     Frame *sp, *sp2;
 
@@ -3133,10 +3134,32 @@ retry:
         }
 display:
         /* display picture */
-        if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
-            video_display(is);
+        if (!display_disable && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown) {
+            if (is->force_refresh) {
+                /* Consume the request *before* drawing. video_display()
+                 * re-arms force_refresh while an animation is still
+                 * running (the sidebar slide, the speed / seek / sponsor
+                 * overlays, the progress bar), and that re-arm has to
+                 * survive this call — it is the only thing that keeps
+                 * frames coming when the stream itself produces none.
+                 *
+                 * Stock ffplay clears the flag after video_display()
+                 * returns, which wiped exactly that re-arm: an animation
+                 * then advanced only while new video frames happened to
+                 * arrive. On a finished or paused video a Tab press drew
+                 * one frame at the very start of the slide — offset ~0,
+                 * so the panel looked like it never opened. */
+                is->force_refresh = 0;
+                video_display(is);
+                redrew = 1;
+            }
+        }
     }
-    is->force_refresh = 0;
+    /* Nothing drew, so nothing consumed the request: drop it here rather
+     * than let a stale flag keep the event loop awake. After a redraw the
+     * flag is left exactly as video_display() set it. */
+    if (!redrew)
+        is->force_refresh = 0;
     if (show_status) {
         AVBPrint buf;
         static int64_t last_time;
