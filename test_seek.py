@@ -144,6 +144,21 @@ def main() -> int:
           "origin=10.1" in (s.log[-1] if s.log else ""),
           s.log[-1] if s.log else "")
 
+    # 5b. Pressing back at the very start of a video: the target clamps to
+    #     0.0 and the file starts at 0.0, so the fast path applies. This
+    #     was a livelock — out of range meant a session restart, whose
+    #     replay of the queued press restarted again, every 6.5 s.
+    run_case("back at t=0 with the file starting at 0",
+             size_mb=4.8, span=(0.0, 34.1), pos=0.0, delta=-10.0,
+             expect="seek")
+
+    # 5c. Same press, but the file starts mid-video: 0.0 really is not on
+    #     disk, so the restart is the honest answer — and it must not be
+    #     mistaken for 5b.
+    run_case("back to t=0 when the file starts at 111.8 s",
+             size_mb=4.8, span=(111.8, 1145.9), pos=112.0, delta=-10.0,
+             expect="restart")
+
     # 6. A press during a restart is kept as the latest intent and
     #    applied once the session is open.
     s = Stub(int(18.5 * MB), (0.0, 122.0), 4.8)

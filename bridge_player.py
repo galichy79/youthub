@@ -880,9 +880,20 @@ class LivePlayer:
         bytes_per_sec = (size / downloaded_sec
                          if size > 0 and downloaded_sec > 0 else 0)
         target_bytes = target_rel * bytes_per_sec
+        # `>= 0`, not `> 0`: a target of exactly the file's first packet
+        # IS inside the file. The clamped case lands exactly here —
+        # pressing back at the very start of a video gives target=0.0 with
+        # origin=0.0 — and calling that out of range restarted the whole
+        # session to move less than a second, which then replayed the
+        # queued press and restarted again: a livelock at t=0 that needed
+        # no user input to keep spinning. ffplay clamps a negative
+        # SEEK_REL to the file's start on its own, so the fast path is
+        # both correct and instant here. A target genuinely before the
+        # first packet (origin > 0) still comes out negative and still
+        # restarts, which is what it has to do.
         in_range = (
-            target_rel > 0
-            and target_bytes > 0
+            bytes_per_sec > 0
+            and target_rel >= 0
             and target_bytes < size - SEEK_SAFETY_BYTES
         )
         cprint(
