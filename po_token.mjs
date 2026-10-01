@@ -73,39 +73,97 @@ function _field(text, name, valuePrefix = '') {
   return m ? m[1] : null;
 }
 
-// Fetch the BotGuard challenge from the YouTube *homepage* rather than
-// from InnerTube /att/get, together with that page's EVENT_ID.
+// Take every `bgChallenge` object out of the decoded page by matching
+// braces, instead of slicing a fixed window around the key.
 //
-// Why it matters: SABR verifies that the PO Token came from a snapshot
-// that carries the page context it was minted against. A token from an
-// InnerTube challenge has no such context, so the stream runs on the
-// cold-start allowance and dies at ~60s with stream protection status
+// A fixed window is a race against how large YouTube's current BotGuard
+// program happens to be, and that race is lost regularly. Measured
+// 2026-10-01: `program` ran 38 695-39 111 characters on most responses,
+// fitting the old 40 000-character forward window by only ~900
+// characters, but 40 371 and 42 899 on the responses that broke
+// playback. A cut value has no closing quote, so `_field` returned null
+// for `program`, and `globalName` — which follows it — never entered the
+// window at all. One response in eight failed that way; each failure
+// dropped the token to the InnerTube challenge and killed the stream at
+// ~60s (stream protection 2 -> 3).
+//
+// Brace matching has no size to get wrong. Strings are tracked so a
+// brace or a backslash inside a value cannot unbalance the count.
+function _challengeObjects(full) {
+  const key = '"bgChallenge":';
+  const out = [];
+  for (let at = full.indexOf(key); at >= 0; at = full.indexOf(key, at + 1)) {
+    const start = full.indexOf('{', at + key.length);
+    if (start < 0) continue;
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < full.length; i++) {
+      const c = full[i];
+      if (inStr) {
+        if (esc) { esc = false; continue; }
+        if (c === '\\') { esc = true; continue; }
+        if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; continue; }
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) { out.push(full.slice(start, i + 1)); break; }
+      }
+    }
+  }
+  return out;
+}
+
+// Parse the BotGuard challenge out of the homepage HTML, together with
+// that page's EVENT_ID.
+//
+// Why the homepage matters: SABR verifies that the PO Token came from a
+// snapshot that carries the page context it was minted against. A token
+// from an InnerTube challenge has no such context, so the stream runs on
+// the cold-start allowance and dies at ~60s with stream protection status
 // 2 -> 3. Measured both ways on the same page-native challenge: without
 // EVENT_ID status 2 at ~60s, with it status 1 past 65s (PipePipeClient
 // PR #86, "use the page-native BotGuard attestation context").
+//
+// Split out from the fetch so it can be tested against fixed HTML: the
+// way this parse fails is a property of the markup, not of the network.
+// (`challenge` is deliberately not part of the result — it sits next to
+// bgChallenge rather than inside it, and nothing downstream reads it.)
+export function parsePageContext(html) {
+  const eventId = _field(html, 'EVENT_ID');
+  const objects = _challengeObjects(_decodeEscapes(html));
+  if (!objects.length) throw new Error('no bgChallenge on homepage');
+
+  // A page can mention bgChallenge more than once. Take the mention that
+  // actually carries the fields rather than assuming the first one is it.
+  let best = null;
+  for (const obj of objects) {
+    const fields = {
+      program: _field(obj, 'program'),
+      globalName: _field(obj, 'globalName'),
+      interpreterUrl: _field(
+        obj, 'privateDoNotAccessOrElseTrustedResourceUrlWrappedValue'),
+    };
+    if (!best) best = fields;
+    if (fields.program && fields.globalName && fields.interpreterUrl) {
+      best = fields;
+      break;
+    }
+  }
+  if (!eventId || !best.program || !best.globalName || !best.interpreterUrl)
+    throw new Error('homepage context incomplete '
+      + `(eventId=${!!eventId} program=${!!best.program} `
+      + `globalName=${!!best.globalName} interpreterUrl=${!!best.interpreterUrl})`);
+  return { eventId, ...best };
+}
+
 async function _fetchPageContext() {
   const res = await fetch(HOMEPAGE, {
     headers: { 'user-agent': REAL_UA, 'accept-language': 'en-US,en;q=0.9' },
   });
   if (!res.ok) throw new Error(`homepage HTTP ${res.status}`);
-  const html = await res.text();
-
-  const eventId = _field(html, 'EVENT_ID');
-  const at = html.indexOf('bgChallenge');
-  if (at < 0) throw new Error('no bgChallenge on homepage');
-  const near = _decodeEscapes(
-    html.slice(Math.max(0, at - 4000), at + 40000));
-
-  const program = _field(near, 'program');
-  const globalName = _field(near, 'globalName');
-  const interpreterUrl = _field(
-    near, 'privateDoNotAccessOrElseTrustedResourceUrlWrappedValue');
-  const challenge = _field(near, 'challenge', 'a=');
-  if (!eventId || !program || !globalName || !interpreterUrl)
-    throw new Error('homepage context incomplete '
-      + `(eventId=${!!eventId} program=${!!program} `
-      + `globalName=${!!globalName} interpreterUrl=${!!interpreterUrl})`);
-  return { eventId, program, globalName, interpreterUrl, challenge };
+  return parsePageContext(await res.text());
 }
 
 async function _runChallenge(visitorData) {
