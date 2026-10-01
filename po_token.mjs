@@ -158,12 +158,29 @@ export function parsePageContext(html) {
   return { eventId, ...best };
 }
 
+// The parse has no size ceiling any more, but the homepage still varies
+// between responses — a consent page, a reshuffled config, a different
+// field set — and a single unlucky fetch costs the whole video, which
+// then dies at ~60s. One extra request is cheap next to that.
+const PAGE_CTX_ATTEMPTS = 3;
+
 async function _fetchPageContext() {
-  const res = await fetch(HOMEPAGE, {
-    headers: { 'user-agent': REAL_UA, 'accept-language': 'en-US,en;q=0.9' },
-  });
-  if (!res.ok) throw new Error(`homepage HTTP ${res.status}`);
-  return parsePageContext(await res.text());
+  let lastErr;
+  for (let attempt = 1; attempt <= PAGE_CTX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(HOMEPAGE, {
+        headers: { 'user-agent': REAL_UA, 'accept-language': 'en-US,en;q=0.9' },
+      });
+      if (!res.ok) throw new Error(`homepage HTTP ${res.status}`);
+      return parsePageContext(await res.text());
+    } catch (e) {
+      lastErr = e;
+      if (attempt < PAGE_CTX_ATTEMPTS)
+        log(`page context attempt ${attempt}/${PAGE_CTX_ATTEMPTS} failed `
+            + `(${e.message}) — retrying`);
+    }
+  }
+  throw lastErr;
 }
 
 async function _runChallenge(visitorData) {
@@ -196,8 +213,12 @@ async function _runChallenge(visitorData) {
     log(`page context ok (EVENT_ID=${pageCtx.eventId}, `
         + `globalName=${pageCtx.globalName})`);
   } catch (e) {
-    log(`page context unavailable (${e.message}) — `
-        + 'falling back to the InnerTube challenge');
+    // Deliberately loud: this is the one line that explains a stream that
+    // dies at ~60s with stream protection status 3, and it was previously
+    // buried among the per-segment protection chatter.
+    log(`FALLBACK: no page-native context (${e.message}) — using the `
+        + 'InnerTube challenge; that token carries no page context, so '
+        + 'expect the stream to die at ~60s');
   }
 
   let program, globalName, interpreterUrl;
